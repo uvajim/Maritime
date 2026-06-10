@@ -307,8 +307,9 @@ jobs:
       - name: Run Hardhat tests
         run: npx hardhat test
         env:
-          # Hardhat uses local in-memory network by default — no external keys needed.
-          HARDHAT_NETWORK: hardhat
+          # Hardhat 3 uses "hardhatMainnet" for the built-in EDR simulated network.
+          # The network name "hardhat" (Hardhat 2 default) does not exist in this config.
+          HARDHAT_NETWORK: hardhatMainnet
 
       - name: Generate gas report
         run: |
@@ -362,7 +363,7 @@ jobs:
             BUILD_ENV=ci
 
       - name: Scan with Trivy
-        uses: aquasecurity/trivy-action@0.32.0
+        uses: aquasecurity/trivy-action@0.36.0
         with:
           image-ref: maritime/${{ matrix.name }}:scan
           format: sarif
