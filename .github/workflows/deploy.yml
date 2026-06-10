@@ -2,34 +2,33 @@
 # Maritime · Deployment Workflow
 #
 # Deploys to one of three environments:
-#   • dev   — feature integration; auto-deploys when CI passes on dev branch
-#   • beta  — staging / QA;        auto-deploys when CI passes on beta branch
-#   • main  — production;          auto-deploys when CI passes on main branch
+#   • dev   — feature integration; auto-deploys on push to dev branch
+#   • beta  — staging / QA;        auto-deploys on push to beta branch
+#   • main  — production;          auto-deploys on push to main branch
 #
 # ⚠  SECURITY INVARIANT ⚠
-#   Deployments ONLY run from the three protected branches listed above
-#   OR via manual workflow_dispatch with explicit environment selection.
-#   Arbitrary feature branches CANNOT trigger a deployment.
-#   See docs/cicd/BRANCH_PROTECTION.md for required branch protection rules.
+#   Deployments ONLY run from the three protected branches above OR via
+#   manual workflow_dispatch. Arbitrary branches cannot deploy.
 #
-# Deployment targets (initial):
-#   • Cairo frontend  → Vercel
-#   • Cairo-backend   → Railway
-#   • cairo-erc20     → EVM network via Hardhat (testnet for dev/beta, mainnet for main)
+# Architecture
+# ────────────
+# Frontend (Vercel):
+#   Vercel is the source of truth for its own environment variables.
+#   Configure them once in the Vercel dashboard (or via `vercel env add`
+#   locally). The CI job only authenticates and calls `vercel deploy` —
+#   it does NOT push vars from GitHub into Vercel. The VERCEL_TOKEN must
+#   be a Vercel personal access token (vercel.com/account/tokens), NOT
+#   the VERCEL_OIDC_TOKEN injected into serverless functions at runtime.
 #
-# Env var sync design
-# ───────────────────
-# Each deploy job syncs its own provider's env vars immediately before
-# deploying. This means:
-#   • Vercel sync only runs if VERCEL_TOKEN is set — no Vercel token = skip,
-#     not fail
-#   • Railway sync only runs if RAILWAY_TOKEN is set — same
-#   • Providers are fully independent; adding one doesn't require the other
-#   • Each job self-describes what it needs; no shared sync gate to unblock
+# Backend (Railway):
+#   Railway is the source of truth for its own service variables.
+#   Configure them in the Railway dashboard. The CI job authenticates
+#   and calls `railway up`. No variable pushing.
 #
-# Migration to other targets (Render, Fly.io, AWS, GCP, Azure, self-hosted)
-# requires only adding a new job or replacing environment-specific steps.
-# See docs/cicd/MIGRATION.md for migration patterns.
+# Contracts (Hardhat):
+#   Only redeploys when .sol files changed in this push, or when
+#   deploy_contracts=true is set explicitly via workflow_dispatch.
+#   Never auto-redeploys when only JS/TS/config files changed.
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Deploy
@@ -59,12 +58,11 @@ on:
         default: "true"
         type: boolean
       deploy_contracts:
-        description: "Deploy contracts (Hardhat)"
+        description: "Deploy contracts (Hardhat) — ignores diff check"
         required: false
         default: "false"
         type: boolean
 
-# Never cancel a deployment in-progress — could leave infra in a partial state.
 concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: false
@@ -74,34 +72,35 @@ permissions:
   deployments: write
 
 # ═════════════════════════════════════════════════════════════════════════════
-# GUARD: Verify we are on an approved deployment branch before any job runs.
+# GUARD: resolve environment, check branch, detect what changed
 # ═════════════════════════════════════════════════════════════════════════════
 jobs:
   guard:
     name: "🚦 Branch guard"
     runs-on: ubuntu-latest
     outputs:
-      environment:      ${{ steps.resolve.outputs.environment }}
-      deploy_frontend:  ${{ steps.resolve.outputs.deploy_frontend }}
-      deploy_backend:   ${{ steps.resolve.outputs.deploy_backend }}
-      deploy_contracts: ${{ steps.resolve.outputs.deploy_contracts }}
+      environment:        ${{ steps.resolve.outputs.environment }}
+      deploy_frontend:    ${{ steps.resolve.outputs.deploy_frontend }}
+      deploy_backend:     ${{ steps.resolve.outputs.deploy_backend }}
+      deploy_contracts:   ${{ steps.resolve.outputs.deploy_contracts }}
+      contracts_changed:  ${{ steps.diff.outputs.contracts_changed }}
     steps:
-      - name: Resolve environment and deployment targets
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # need parent commit for diff
+
+      - name: Resolve environment and targets
         id: resolve
         run: |
           REF="${{ github.ref }}"
-          DISPATCH_ENV="${{ github.event.inputs.environment }}"
-
-          if   [[ "$REF" == "refs/heads/main"  ]]; then ENV=main
-          elif [[ "$REF" == "refs/heads/beta"  ]]; then ENV=beta
-          elif [[ "$REF" == "refs/heads/dev"   ]]; then ENV=dev
-          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then ENV="$DISPATCH_ENV"
+          if   [[ "$REF" == "refs/heads/main" ]]; then ENV=main
+          elif [[ "$REF" == "refs/heads/beta" ]]; then ENV=beta
+          elif [[ "$REF" == "refs/heads/dev"  ]]; then ENV=dev
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then ENV="${{ github.event.inputs.environment }}"
           else
-            echo "❌ Deployments are not allowed from branch: $REF"
-            echo "   Only dev, beta, and main branches may trigger deployments."
+            echo "❌ Branch $REF is not a deployment branch."
             exit 1
           fi
-
           echo "environment=$ENV" >> "$GITHUB_OUTPUT"
 
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
@@ -113,15 +112,37 @@ jobs:
             echo "deploy_backend=true"    >> "$GITHUB_OUTPUT"
             echo "deploy_contracts=false" >> "$GITHUB_OUTPUT"
           fi
-
           echo "✅ Deploying to: $ENV"
+
+      - name: Detect contract changes
+        id: diff
+        run: |
+          # Check if any Solidity files changed in this push.
+          # On workflow_dispatch, treat as no auto-change (dispatch controls it explicitly).
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "contracts_changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only HEAD~1 HEAD -- 'cairo-erc20/contracts/**/*.sol' 'cairo-erc20/hardhat.config.ts' 2>/dev/null | wc -l)
+          if [ "$CHANGED" -gt 0 ]; then
+            echo "contracts_changed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$CHANGED contract file(s) changed — contract deployment will run"
+            git diff --name-only HEAD~1 HEAD -- 'cairo-erc20/contracts/**/*.sol' 'cairo-erc20/hardhat.config.ts'
+          else
+            echo "contracts_changed=false" >> "$GITHUB_OUTPUT"
+            echo "No Solidity files changed — skipping contract deployment"
+          fi
 
   # ═══════════════════════════════════════════════════════════════════════════
   # DEPLOY: Cairo frontend → Vercel
   #
-  # Skipped entirely if VERCEL_TOKEN is not set in the GitHub Environment.
-  # Env var sync runs inline before the deploy — Vercel is the source of
-  # truth for its own vars; we push from GitHub Secrets/Variables into it.
+  # Vercel manages its own env vars — configure them in the Vercel dashboard.
+  # This job only authenticates and deploys; it does not push or sync vars.
+  #
+  # Required secret in GitHub Environment: VERCEL_TOKEN
+  #   → Generate at vercel.com/account/tokens (personal access token, not OIDC)
+  # Required variables: VERCEL_ORG_ID, VERCEL_PROJECT_ID
+  #   → Found in .vercel/project.json after running `vercel link` locally
   # ═══════════════════════════════════════════════════════════════════════════
   deploy-cairo:
     name: "🌐 Deploy cairo → Vercel (${{ needs.guard.outputs.environment }})"
@@ -130,7 +151,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: ${{ needs.guard.outputs.environment }}
-      url: ${{ steps.vercel-deploy.outputs.deploy_url }}
+      url: ${{ steps.deploy.outputs.deploy_url }}
     steps:
       - uses: actions/checkout@v4
 
@@ -141,68 +162,17 @@ jobs:
           cache-dependency-path: Cairo/package-lock.json
 
       - name: Install Vercel CLI
-        run: npm install -g vercel --silent
+        run: npm install -g vercel@latest --silent
 
-      # ── Sync env vars into Vercel ─────────────────────────────────────────
-      # The `secrets` context is unavailable in `if:` — guard inside the script.
-      - name: Sync env vars → Vercel
-        env:
-          VERCEL_TOKEN:      ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
-          TARGET_ENV:        ${{ needs.guard.outputs.environment }}
-        run: |
-          if [ -z "$VERCEL_TOKEN" ]; then
-            echo "::notice::VERCEL_TOKEN not set — skipping Vercel env sync"
-            exit 0
-          fi
-          case "$TARGET_ENV" in
-            main) VERCEL_TARGET="production" ;;
-            *)    VERCEL_TARGET="preview"    ;;
-          esac
-
-          upsert_vercel_env() {
-            local KEY="$1" VALUE="$2" TYPE="${3:-plain}"
-            if [ -z "$VALUE" ]; then echo "  ⚠ Skipping $KEY (empty)"; return; fi
-            EXISTING=$(curl -sf \
-              -H "Authorization: Bearer $VERCEL_TOKEN" \
-              "https://api.vercel.com/v9/projects/$VERCEL_PROJECT_ID/env?target=$VERCEL_TARGET" \
-              | jq -r --arg k "$KEY" '.envs[] | select(.key==$k) | .id' 2>/dev/null || echo "")
-            if [ -n "$EXISTING" ]; then
-              curl -sf -X PATCH \
-                -H "Authorization: Bearer $VERCEL_TOKEN" \
-                -H "Content-Type: application/json" \
-                -d "{\"value\":\"$VALUE\",\"type\":\"$TYPE\"}" \
-                "https://api.vercel.com/v9/projects/$VERCEL_PROJECT_ID/env/$EXISTING" >/dev/null
-            else
-              curl -sf -X POST \
-                -H "Authorization: Bearer $VERCEL_TOKEN" \
-                -H "Content-Type: application/json" \
-                -d "{\"key\":\"$KEY\",\"value\":\"$VALUE\",\"type\":\"$TYPE\",\"target\":[\"$VERCEL_TARGET\"]}" \
-                "https://api.vercel.com/v9/projects/$VERCEL_PROJECT_ID/env" >/dev/null
-            fi
-            echo "  ✓ $KEY"
-          }
-
-          echo "Syncing env vars → Vercel ($VERCEL_TARGET)…"
-          upsert_vercel_env "NEXT_PUBLIC_BACKEND_URL"              "${{ vars.BACKEND_URL }}"                plain
-          upsert_vercel_env "NEXT_PUBLIC_CHAIN_ID"                 "${{ vars.CHAIN_ID }}"                   plain
-          upsert_vercel_env "NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID" "${{ secrets.WALLETCONNECT_PROJECT_ID }}" sensitive
-          upsert_vercel_env "NEXT_PUBLIC_FIREBASE_API_KEY"         "${{ secrets.FIREBASE_API_KEY }}"         sensitive
-          upsert_vercel_env "NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN"     "${{ vars.FIREBASE_AUTH_DOMAIN }}"        plain
-          upsert_vercel_env "NEXT_PUBLIC_FIREBASE_PROJECT_ID"      "${{ vars.FIREBASE_PROJECT_ID }}"         plain
-          upsert_vercel_env "NEXT_PUBLIC_OVERSEER_ADDRESS"         "${{ vars.OVERSEER_ADDRESS }}"            plain
-          upsert_vercel_env "NEXT_PUBLIC_EQUITY_VAULT_ADDRESS"     "${{ vars.EQUITY_VAULT_ADDRESS }}"        plain
-          upsert_vercel_env "NEXT_PUBLIC_MDT_ADDRESS"              "${{ vars.MDT_ADDRESS }}"                 plain
-          echo "✅ Vercel env sync complete"
-
-      # ── Deploy ─────────────────────────────────────────────────────────────
-      - name: Pull Vercel project settings
+      - name: Pull Vercel project settings & env vars
         working-directory: Cairo
         env:
           VERCEL_TOKEN:      ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID:     ${{ vars.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
-        run: vercel pull --yes --environment=${{ needs.guard.outputs.environment == 'main' && 'production' || 'preview' }} --token="$VERCEL_TOKEN"
+        run: |
+          TARGET=${{ needs.guard.outputs.environment == 'main' && 'production' || 'preview' }}
+          vercel pull --yes --environment="$TARGET" --token="$VERCEL_TOKEN"
 
       - name: Build
         working-directory: Cairo
@@ -215,7 +185,7 @@ jobs:
           vercel build $FLAG --token="$VERCEL_TOKEN"
 
       - name: Deploy to Vercel
-        id: vercel-deploy
+        id: deploy
         working-directory: Cairo
         env:
           VERCEL_TOKEN:      ${{ secrets.VERCEL_TOKEN }}
@@ -227,16 +197,14 @@ jobs:
           echo "deploy_url=$DEPLOY_URL" >> "$GITHUB_OUTPUT"
           echo "✅ Deployed Cairo to: $DEPLOY_URL"
 
-      # ── Migration placeholder ─────────────────────────────────────────────
-      # Render: uses: render-oss/render-deploy-action@v1
-      # Fly.io: run: flyctl deploy --remote-only
-      # See docs/cicd/MIGRATION.md
-
   # ═══════════════════════════════════════════════════════════════════════════
   # DEPLOY: Cairo-backend → Railway
   #
-  # Skipped entirely if RAILWAY_TOKEN is not set in the GitHub Environment.
-  # Env var sync runs inline before the deploy.
+  # Railway manages its own service env vars — configure in Railway dashboard.
+  # This job only authenticates and deploys.
+  #
+  # Required secret: RAILWAY_TOKEN (railway.app → Account → API Tokens)
+  # Required variables: RAILWAY_PROJECT_ID, RAILWAY_SERVICE_ID
   # ═══════════════════════════════════════════════════════════════════════════
   deploy-backend:
     name: "🖥️ Deploy cairo-backend → Railway (${{ needs.guard.outputs.environment }})"
@@ -245,64 +213,15 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: ${{ needs.guard.outputs.environment }}
-      url: ${{ steps.railway-deploy.outputs.deploy_url }}
+      url: ${{ steps.deploy.outputs.deploy_url }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Railway CLI
         run: npm install -g @railway/cli --silent
 
-      # ── Sync env vars into Railway ────────────────────────────────────────
-      - name: Sync env vars → Railway
-        env:
-          RAILWAY_TOKEN:      ${{ secrets.RAILWAY_TOKEN }}
-          RAILWAY_SERVICE_ID: ${{ vars.RAILWAY_SERVICE_ID }}
-          RAILWAY_PROJECT_ID: ${{ vars.RAILWAY_PROJECT_ID }}
-        run: |
-          if [ -z "$RAILWAY_TOKEN" ]; then
-            echo "::notice::RAILWAY_TOKEN not set — skipping Railway env sync"
-            exit 0
-          fi
-          railway_set() {
-            local KEY="$1" VALUE="$2"
-            if [ -z "$VALUE" ]; then echo "  ⚠ Skipping $KEY (empty)"; return; fi
-            echo "$VALUE" | RAILWAY_TOKEN="$RAILWAY_TOKEN" \
-              railway variables set "$KEY" \
-                --service "$RAILWAY_SERVICE_ID" \
-                --project "$RAILWAY_PROJECT_ID" \
-              2>/dev/null \
-              && echo "  ✓ $KEY" \
-              || echo "  ⚠ $KEY (service may not exist yet — will be set on first deploy)"
-          }
-
-          echo "Syncing env vars → Railway…"
-          railway_set "NODE_ENV"                   "${{ vars.NODE_ENV }}"
-          railway_set "PORT"                       "${{ vars.BACKEND_PORT }}"
-          railway_set "CHAIN_ID"                   "${{ vars.CHAIN_ID }}"
-          railway_set "RPC_URL"                    "${{ secrets.RPC_URL }}"
-          railway_set "OVERSEER_ADDRESS"           "${{ vars.OVERSEER_ADDRESS }}"
-          railway_set "EQUITY_VAULT_ADDRESS"       "${{ vars.EQUITY_VAULT_ADDRESS }}"
-          railway_set "MDT_ADDRESS"                "${{ vars.MDT_ADDRESS }}"
-          railway_set "BACKEND_SIGNER_PRIVATE_KEY" "${{ secrets.BACKEND_SIGNER_PRIVATE_KEY }}"
-          railway_set "OPERATOR_PRIVATE_KEY"       "${{ secrets.OPERATOR_PRIVATE_KEY }}"
-          railway_set "ADMIN_API_KEY"              "${{ secrets.ADMIN_API_KEY }}"
-          railway_set "OFFER_TTL"                  "${{ vars.OFFER_TTL }}"
-          railway_set "BRIDGE_API_KEY"             "${{ secrets.BRIDGE_API_KEY }}"
-          railway_set "APCA_API_KEY_ID"            "${{ secrets.APCA_API_KEY_ID }}"
-          railway_set "APCA_API_SECRET_KEY"        "${{ secrets.APCA_API_SECRET_KEY }}"
-          railway_set "ALPACA_PAPER"               "${{ vars.ALPACA_PAPER }}"
-          railway_set "PLAID_CLIENT_ID"            "${{ secrets.PLAID_CLIENT_ID }}"
-          railway_set "PLAID_SECRET"               "${{ secrets.PLAID_SECRET }}"
-          railway_set "PLAID_ENV"                  "${{ vars.PLAID_ENV }}"
-          railway_set "AIRWALLEX_CLIENT_ID"        "${{ secrets.AIRWALLEX_CLIENT_ID }}"
-          railway_set "AIRWALLEX_API_KEY"          "${{ secrets.AIRWALLEX_API_KEY }}"
-          railway_set "AIRWALLEX_WEBHOOK_SECRET"   "${{ secrets.AIRWALLEX_WEBHOOK_SECRET }}"
-          railway_set "AIRWALLEX_ENV"              "${{ vars.AIRWALLEX_ENV }}"
-          echo "✅ Railway env sync complete"
-
-      # ── Deploy ─────────────────────────────────────────────────────────────
       - name: Deploy to Railway
-        id: railway-deploy
+        id: deploy
         working-directory: Cairo-backend
         env:
           RAILWAY_TOKEN:      ${{ secrets.RAILWAY_TOKEN }}
@@ -317,18 +236,22 @@ jobs:
           echo "deploy_url=${DEPLOY_URL:-https://railway.app}" >> "$GITHUB_OUTPUT"
           echo "✅ Cairo-backend deployed to Railway"
 
-      # ── Migration placeholder ─────────────────────────────────────────────
-      # Render: curl -sX POST https://api.render.com/v1/services/$ID/deploys
-      # Docker: docker pull ghcr.io/uvajim/maritime-cairo-backend:<env>
-      # See docs/cicd/MIGRATION.md
-
   # ═══════════════════════════════════════════════════════════════════════════
-  # DEPLOY: Smart contracts (manual only — never auto-deployed on push)
+  # DEPLOY: Smart contracts (Hardhat)
+  #
+  # Runs when:
+  #   • .sol files or hardhat.config.ts changed in this push, OR
+  #   • deploy_contracts=true passed via workflow_dispatch
+  #
+  # Never runs automatically on non-contract changes.
+  # Always requires explicit dispatch to deploy to mainnet (main env).
   # ═══════════════════════════════════════════════════════════════════════════
   deploy-contracts:
     name: "📜 Deploy contracts (${{ needs.guard.outputs.environment }})"
     needs: guard
-    if: needs.guard.outputs.deploy_contracts == 'true'
+    if: |
+      needs.guard.outputs.contracts_changed == 'true' ||
+      needs.guard.outputs.deploy_contracts == 'true'
     runs-on: ubuntu-latest
     environment: ${{ needs.guard.outputs.environment }}
     steps:
@@ -348,22 +271,30 @@ jobs:
         working-directory: cairo-erc20
         run: npx hardhat compile
 
+      - name: Confirm mainnet deploy
+        # Extra guard: mainnet deploys must be explicit dispatch, never auto.
+        if: needs.guard.outputs.environment == 'main' && github.event_name != 'workflow_dispatch'
+        run: |
+          echo "❌ Mainnet contract deployment requires explicit workflow_dispatch."
+          echo "   Auto-deploy on push is disabled for mainnet to prevent accidental deploys."
+          exit 1
+
       - name: Determine network
         id: network
         run: |
           case "${{ needs.guard.outputs.environment }}" in
-            main)  echo "network=mainnet"  >> "$GITHUB_OUTPUT" ;;
-            *)     echo "network=sepolia"  >> "$GITHUB_OUTPUT" ;;
+            main) echo "network=mainnet" >> "$GITHUB_OUTPUT" ;;
+            *)    echo "network=sepolia" >> "$GITHUB_OUTPUT" ;;
           esac
 
       - name: Deploy contracts
         working-directory: cairo-erc20
         env:
           SEPOLIA_RPC_URL:      ${{ secrets.SEPOLIA_RPC_URL }}
-          MAINNET_RPC_URL:      ${{ secrets.MAINNET_RPC_URL }}
+          MAINNET_RPC_URL:      ${{ secrets.RPC_URL }}
           DEPLOYER_PRIVATE_KEY: ${{ secrets.DEPLOYER_PRIVATE_KEY }}
-          USER_PRIVATE_KEY:     ${{ secrets.USER_PRIVATE_KEY }}
-          VAULT_PRIVATE_KEY:    ${{ secrets.VAULT_PRIVATE_KEY }}
+          USER_PRIVATE_KEY:     ${{ secrets.DEPLOYER_PRIVATE_KEY }}
+          VAULT_PRIVATE_KEY:    ${{ secrets.MINTER_PRIVATE_KEY }}
           ETHERSCAN_API_KEY:    ${{ secrets.ETHERSCAN_API_KEY }}
         run: |
           NETWORK="${{ steps.network.outputs.network }}"
@@ -382,11 +313,10 @@ jobs:
           ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
         run: |
           echo "::notice::Add contract addresses to this step after first deployment."
-          # npx hardhat verify --network ${{ steps.network.outputs.network }} <ADDRESS> [args...]
+          # npx hardhat verify --network ${{ steps.network.outputs.network }} <ADDRESS>
 
   # ═══════════════════════════════════════════════════════════════════════════
   # POST-DEPLOY: Smoke tests
-  # Runs after whichever deploy jobs completed (skips gracefully if both skipped)
   # ═══════════════════════════════════════════════════════════════════════════
   smoke-test:
     name: "💨 Smoke test (${{ needs.guard.outputs.environment }})"
@@ -406,15 +336,10 @@ jobs:
           fi
           for i in 1 2 3 4 5; do
             STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "$BACKEND_URL/health" || echo "000")
-            if [ "$STATUS" = "200" ]; then
-              echo "✅ Backend healthy ($BACKEND_URL/health → 200)"
-              exit 0
-            fi
-            echo "Attempt $i/5: got $STATUS, retrying in 10s…"
-            sleep 10
+            [ "$STATUS" = "200" ] && echo "✅ Backend healthy" && exit 0
+            echo "Attempt $i/5: $STATUS, retrying…"; sleep 10
           done
-          echo "❌ Backend health check failed"
-          exit 1
+          echo "❌ Backend health check failed"; exit 1
 
       - name: Health-check frontend
         run: |
@@ -424,4 +349,4 @@ jobs:
             exit 0
           fi
           STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "$FRONTEND_URL" || echo "000")
-          [ "$STATUS" = "200" ] && echo "✅ Frontend reachable ($FRONTEND_URL → 200)" || { echo "❌ Frontend returned $STATUS"; exit 1; }
+          [ "$STATUS" = "200" ] && echo "✅ Frontend reachable" || { echo "❌ Got $STATUS"; exit 1; }
