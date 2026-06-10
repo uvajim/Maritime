@@ -144,14 +144,17 @@ jobs:
         run: npm install -g vercel --silent
 
       # ── Sync env vars into Vercel ─────────────────────────────────────────
-      # Runs only when VERCEL_TOKEN is present. Skipped gracefully otherwise.
+      # The `secrets` context is unavailable in `if:` — guard inside the script.
       - name: Sync env vars → Vercel
-        if: secrets.VERCEL_TOKEN != ''
         env:
           VERCEL_TOKEN:      ${{ secrets.VERCEL_TOKEN }}
           VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
           TARGET_ENV:        ${{ needs.guard.outputs.environment }}
         run: |
+          if [ -z "$VERCEL_TOKEN" ]; then
+            echo "::notice::VERCEL_TOKEN not set — skipping Vercel env sync"
+            exit 0
+          fi
           case "$TARGET_ENV" in
             main) VERCEL_TARGET="production" ;;
             *)    VERCEL_TARGET="preview"    ;;
@@ -250,14 +253,16 @@ jobs:
         run: npm install -g @railway/cli --silent
 
       # ── Sync env vars into Railway ────────────────────────────────────────
-      # Runs only when RAILWAY_TOKEN is present.
       - name: Sync env vars → Railway
-        if: secrets.RAILWAY_TOKEN != ''
         env:
           RAILWAY_TOKEN:      ${{ secrets.RAILWAY_TOKEN }}
           RAILWAY_SERVICE_ID: ${{ vars.RAILWAY_SERVICE_ID }}
           RAILWAY_PROJECT_ID: ${{ vars.RAILWAY_PROJECT_ID }}
         run: |
+          if [ -z "$RAILWAY_TOKEN" ]; then
+            echo "::notice::RAILWAY_TOKEN not set — skipping Railway env sync"
+            exit 0
+          fi
           railway_set() {
             local KEY="$1" VALUE="$2"
             if [ -z "$VALUE" ]; then echo "  ⚠ Skipping $KEY (empty)"; return; fi
