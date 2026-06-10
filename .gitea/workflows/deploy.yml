@@ -1,19 +1,24 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Maritime · Gitea Actions Deployment  (Gitea-specific)
+# Maritime · Gitea Actions — Deployment
 #
-# Gitea differences vs GitHub deploy.yml:
-#   ✗ GitHub Environments UI (approval gates) — Gitea v1.20+ has basic
-#     environment support but lacks manual-approval gates as of this writing.
-#     Workaround: protect branches so only maintainers can push (see docs).
-#   ✗ environment.url in the job — not displayed in Gitea UI yet.
-#   ✓ workflow_dispatch — supported since Gitea v1.20
-#   ✓ secrets / vars — supported; configure in Settings → Actions → Secrets
+# Kept in sync with .github/workflows/deploy.yml.
+# Differences from the GitHub version:
 #
-# GITEA NOTE ON ENVIRONMENTS:
-#   Gitea Actions environments (v1.22+) support secrets scoped to an
-#   environment name. Set secrets at:
-#     Settings → Actions → Secrets (for repo-level)
-#   Use GITEA_TOKEN instead of GITHUB_TOKEN for registry auth.
+#   ✗ GitHub Environments approval gates — not available in Gitea ≤ v1.22.
+#     Workaround: branch protection rules enforce the deployment gate.
+#     For main, disable push trigger and require manual workflow_dispatch.
+#
+#   ✗ environment.url — not rendered in Gitea UI. Deploy URL is printed
+#     to the job log instead.
+#
+#   ✓ workflow_dispatch     — supported since Gitea v1.20
+#   ✓ secrets / vars        — supported; set in Settings → Actions → Secrets
+#   ✓ contract diff gating  — identical logic to GitHub version
+#   ✓ branch guard          — identical to GitHub version
+#
+# Token notes:
+#   Use secrets.GITEA_TOKEN (or the runner auto-token) instead of
+#   secrets.GITHUB_TOKEN for any Gitea Package Registry auth.
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Deploy (Gitea)
@@ -23,7 +28,9 @@ on:
     branches:
       - dev
       - beta
-      - main
+      # main intentionally omitted — Gitea lacks approval gates, so production
+      # deploys require explicit workflow_dispatch to prevent accidental pushes.
+      # Re-add main here once Gitea Environment approval gates are available.
   workflow_dispatch:
     inputs:
       environment:
@@ -42,7 +49,7 @@ on:
         default: "true"
         type: boolean
       deploy_contracts:
-        description: "Deploy contracts"
+        description: "Deploy contracts (Hardhat) — overrides diff check"
         required: false
         default: "false"
         type: boolean
@@ -52,6 +59,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # GUARD: resolve environment, check branch, detect contract changes
+  # ─────────────────────────────────────────────────────────────────────────
   guard:
     name: "🚦 Branch guard"
     runs-on: ubuntu-latest
@@ -60,22 +70,24 @@ jobs:
       deploy_frontend:   ${{ steps.resolve.outputs.deploy_frontend }}
       deploy_backend:    ${{ steps.resolve.outputs.deploy_backend }}
       deploy_contracts:  ${{ steps.resolve.outputs.deploy_contracts }}
+      contracts_changed: ${{ steps.diff.outputs.contracts_changed }}
     steps:
-      - name: Resolve environment
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Resolve environment and targets
         id: resolve
         run: |
           REF="${{ github.ref }}"
-          DISPATCH_ENV="${{ github.event.inputs.environment }}"
-
           if   [[ "$REF" == "refs/heads/main" ]]; then ENV=main
           elif [[ "$REF" == "refs/heads/beta" ]]; then ENV=beta
           elif [[ "$REF" == "refs/heads/dev"  ]]; then ENV=dev
-          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then ENV="$DISPATCH_ENV"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then ENV="${{ github.event.inputs.environment }}"
           else
             echo "❌ Branch $REF is not a deployment branch."
             exit 1
           fi
-
           echo "environment=$ENV" >> "$GITHUB_OUTPUT"
 
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
@@ -87,9 +99,31 @@ jobs:
             echo "deploy_backend=true"    >> "$GITHUB_OUTPUT"
             echo "deploy_contracts=false" >> "$GITHUB_OUTPUT"
           fi
+          echo "✅ Deploying to: $ENV"
 
+      - name: Detect contract changes
+        id: diff
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "contracts_changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only HEAD~1 HEAD -- \
+            'cairo-erc20/contracts/**/*.sol' \
+            'cairo-erc20/hardhat.config.ts' 2>/dev/null | wc -l)
+          if [ "$CHANGED" -gt 0 ]; then
+            echo "contracts_changed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$CHANGED contract file(s) changed — contract deployment will run"
+          else
+            echo "contracts_changed=false" >> "$GITHUB_OUTPUT"
+            echo "No Solidity files changed — skipping contract deployment"
+          fi
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # DEPLOY: Cairo → Vercel
+  # ─────────────────────────────────────────────────────────────────────────
   deploy-cairo:
-    name: "🌐 Deploy cairo → Vercel"
+    name: "🌐 Deploy cairo → Vercel (${{ needs.guard.outputs.environment }})"
     needs: guard
     if: needs.guard.outputs.deploy_frontend == 'true'
     runs-on: ubuntu-latest
@@ -98,7 +132,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: npm install -g vercel --silent
+      - name: Install Vercel CLI
+        run: npm install -g vercel@latest --silent
       - name: Deploy
         working-directory: Cairo
         env:
@@ -106,20 +141,25 @@ jobs:
           VERCEL_ORG_ID:     ${{ vars.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
         run: |
-          vercel pull --yes --token="$VERCEL_TOKEN" \
-            --environment=${{ needs.guard.outputs.environment == 'main' && 'production' || 'preview' }}
+          TARGET=${{ needs.guard.outputs.environment == 'main' && 'production' || 'preview' }}
+          vercel pull --yes --environment="$TARGET" --token="$VERCEL_TOKEN"
           FLAG=${{ needs.guard.outputs.environment == 'main' && '--prod' || '' }}
           vercel build $FLAG --token="$VERCEL_TOKEN"
-          vercel deploy --prebuilt $FLAG --token="$VERCEL_TOKEN"
+          DEPLOY_URL=$(vercel deploy --prebuilt $FLAG --token="$VERCEL_TOKEN")
+          echo "✅ Deployed Cairo to: $DEPLOY_URL"
 
+  # ─────────────────────────────────────────────────────────────────────────
+  # DEPLOY: Cairo-backend → Railway
+  # ─────────────────────────────────────────────────────────────────────────
   deploy-backend:
-    name: "🖥️ Deploy cairo-backend → Railway"
+    name: "🖥️ Deploy cairo-backend → Railway (${{ needs.guard.outputs.environment }})"
     needs: guard
     if: needs.guard.outputs.deploy_backend == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: npm install -g @railway/cli --silent
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli --silent
       - name: Deploy
         working-directory: Cairo-backend
         env:
@@ -127,38 +167,85 @@ jobs:
           RAILWAY_SERVICE_ID: ${{ vars.RAILWAY_SERVICE_ID }}
           RAILWAY_PROJECT_ID: ${{ vars.RAILWAY_PROJECT_ID }}
         run: |
-          railway up \
+          DEPLOY_URL=$(railway up \
             --service "$RAILWAY_SERVICE_ID" \
             --project "$RAILWAY_PROJECT_ID" \
-            --detach
+            --detach \
+            2>&1 | grep -oE 'https://[^ ]+' | head -1 || echo "")
+          echo "✅ Cairo-backend deployed to Railway${DEPLOY_URL:+: $DEPLOY_URL}"
 
+  # ─────────────────────────────────────────────────────────────────────────
+  # DEPLOY: Contracts — only when .sol files changed or explicit dispatch
+  # ─────────────────────────────────────────────────────────────────────────
   deploy-contracts:
-    name: "📜 Deploy contracts"
+    name: "📜 Deploy contracts (${{ needs.guard.outputs.environment }})"
     needs: guard
-    if: needs.guard.outputs.deploy_contracts == 'true'
+    if: |
+      needs.guard.outputs.contracts_changed == 'true' ||
+      needs.guard.outputs.deploy_contracts == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: npm ci --prefer-offline
+      - name: Install dependencies
         working-directory: cairo-erc20
-      - run: npx hardhat compile
+        run: npm ci --prefer-offline
+      - name: Compile
         working-directory: cairo-erc20
+        run: npx hardhat compile
+
+      - name: Block mainnet auto-deploy
+        if: needs.guard.outputs.environment == 'main' && github.event_name != 'workflow_dispatch'
+        run: |
+          echo "❌ Mainnet contract deployment requires explicit workflow_dispatch."
+          exit 1
+
       - name: Deploy
         working-directory: cairo-erc20
         env:
           SEPOLIA_RPC_URL:      ${{ secrets.SEPOLIA_RPC_URL }}
-          MAINNET_RPC_URL:      ${{ secrets.MAINNET_RPC_URL }}
+          MAINNET_RPC_URL:      ${{ secrets.RPC_URL }}
           DEPLOYER_PRIVATE_KEY: ${{ secrets.DEPLOYER_PRIVATE_KEY }}
-          USER_PRIVATE_KEY:     ${{ secrets.USER_PRIVATE_KEY }}
-          VAULT_PRIVATE_KEY:    ${{ secrets.VAULT_PRIVATE_KEY }}
+          USER_PRIVATE_KEY:     ${{ secrets.DEPLOYER_PRIVATE_KEY }}
+          VAULT_PRIVATE_KEY:    ${{ secrets.MINTER_PRIVATE_KEY }}
           ETHERSCAN_API_KEY:    ${{ secrets.ETHERSCAN_API_KEY }}
         run: |
           NETWORK=${{ needs.guard.outputs.environment == 'main' && 'mainnet' || 'sepolia' }}
+          echo "Deploying to $NETWORK…"
           npx hardhat run scripts/deploy-maritime-deposit.ts --network "$NETWORK"
           npx hardhat run scripts/deploy-equity-vault.ts     --network "$NETWORK"
           npx hardhat run scripts/deploy-overseer.ts         --network "$NETWORK"
           npx hardhat run scripts/deploy-trade-executor.ts   --network "$NETWORK"
           npx hardhat run scripts/grant-roles.ts             --network "$NETWORK"
+          echo "✅ Contracts deployed to $NETWORK"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # SMOKE TEST
+  # ─────────────────────────────────────────────────────────────────────────
+  smoke-test:
+    name: "💨 Smoke test (${{ needs.guard.outputs.environment }})"
+    needs: [guard, deploy-cairo, deploy-backend]
+    if: |
+      always() &&
+      (needs.deploy-cairo.result == 'success' || needs.deploy-backend.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Health-check backend
+        run: |
+          BACKEND_URL="${{ vars.BACKEND_URL }}"
+          if [ -z "$BACKEND_URL" ]; then echo "::notice::BACKEND_URL not set — skipping"; exit 0; fi
+          for i in 1 2 3 4 5; do
+            STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "$BACKEND_URL/health" || echo "000")
+            [ "$STATUS" = "200" ] && echo "✅ Backend healthy" && exit 0
+            echo "Attempt $i/5: $STATUS"; sleep 10
+          done
+          echo "❌ Backend health check failed"; exit 1
+
+      - name: Health-check frontend
+        run: |
+          FRONTEND_URL="${{ vars.FRONTEND_URL }}"
+          if [ -z "$FRONTEND_URL" ]; then echo "::notice::FRONTEND_URL not set — skipping"; exit 0; fi
+          STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "$FRONTEND_URL" || echo "000")
+          [ "$STATUS" = "200" ] && echo "✅ Frontend reachable" || { echo "❌ Got $STATUS"; exit 1; }

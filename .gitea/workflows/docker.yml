@@ -1,29 +1,33 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Maritime · Docker Build & Push
+# Maritime · Gitea Actions — Docker Build & Push
 #
-# Builds and pushes multi-architecture container images:
-#   • linux/amd64  (x86_64 — cloud hosts, most CI runners)
-#   • linux/arm64  (Apple Silicon, Graviton, Raspberry Pi 4+)
+# Kept in sync with .github/workflows/docker.yml.
+# Differences from the GitHub version:
 #
-# Images are published to ghcr.io (GitHub Container Registry).
-# To switch to Docker Hub, Quay, or another registry see the
-# "Image registry" section in docs/cicd/MIGRATION.md.
+#   ✗ Sigstore cosign keyless signing — requires GitHub OIDC (id-token: write).
+#     Gitea has no OIDC token issuer. Replaced with cosign key-based signing
+#     using COSIGN_PRIVATE_KEY secret, or skipped if key not configured.
 #
-# Triggered by:
-#   • Pushes to deployment branches (dev, beta, main)
-#   • Manual workflow_dispatch with optional tag override
+#   ✗ ghcr.io — use Gitea Container Registry instead:
+#     <your-gitea-host>/v2/<owner>/<image>
+#     Set GITEA_REGISTRY variable to your Gitea host (e.g. gitea.example.com).
+#     Falls back to ghcr.io if GITEA_REGISTRY is not set (for mirrored repos).
 #
-# Tags produced:
-#   • <registry>/<image>:latest       (main branch only)
-#   • <registry>/<image>:<env>        (dev | beta | main)
-#   • <registry>/<image>:<sha>        (every build, for rollback)
-#   • <registry>/<image>:<semver>     (when a git tag like v1.2.3 is pushed)
+#   ✓ Multi-arch builds (linux/amd64 + linux/arm64) — identical, requires
+#     Docker + QEMU on the acts_runner host.
 #
-# [Gitea note] Gitea Packages (Gitea Container Registry) is supported as
-# an alternative registry. See .gitea/workflows/docker.yml.
+#   ✓ Build cache — uses local cache (type=local) instead of type=gha.
+#     Gitea's built-in cache (v1.21+) can be enabled by changing to type=gha
+#     once your acts_runner is configured with a Gitea cache backend.
+#
+#   ✓ Metadata (tags, labels) — identical.
+#
+# Runner requirements:
+#   acts_runner v0.2+ with Docker and QEMU binfmt support.
+#   Install QEMU on the host: apt-get install qemu-user-static
 # ─────────────────────────────────────────────────────────────────────────────
 
-name: Docker Build & Push
+name: Docker Build & Push (Gitea)
 
 on:
   push:
@@ -41,10 +45,6 @@ on:
         default: dev
         type: choice
         options: [dev, beta, main]
-      image_tag:
-        description: "Override image tag (leave blank for auto)"
-        required: false
-        type: string
       push_image:
         description: "Push to registry (false = build only)"
         required: false
@@ -53,30 +53,26 @@ on:
 
 concurrency:
   group: docker-${{ github.ref }}
-  cancel-in-progress: false   # Never cancel a docker push mid-flight
-
-permissions:
-  contents: read
-  packages: write   # Required to push to ghcr.io
+  cancel-in-progress: false
 
 env:
-  REGISTRY: ghcr.io
-  # Images are namespaced to the repo owner (lowercase enforced below).
-  IMAGE_CAIRO:         ghcr.io/${{ github.repository_owner }}/maritime-cairo
-  IMAGE_CAIRO_BACKEND: ghcr.io/${{ github.repository_owner }}/maritime-cairo-backend
+  # Override GITEA_REGISTRY with your Gitea host in repo variables.
+  # If unset, falls back to ghcr.io (for mirrored GitHub repos).
+  REGISTRY: ${{ vars.GITEA_REGISTRY || 'ghcr.io' }}
+  IMAGE_CAIRO:         ${{ vars.GITEA_REGISTRY || 'ghcr.io' }}/${{ github.repository_owner }}/maritime-cairo
+  IMAGE_CAIRO_BACKEND: ${{ vars.GITEA_REGISTRY || 'ghcr.io' }}/${{ github.repository_owner }}/maritime-cairo-backend
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────────
-  # Pre-compute metadata shared between image jobs.
+  # Compute shared metadata
   # ─────────────────────────────────────────────────────────────────────────
   meta:
     name: "📋 Compute image tags"
     runs-on: ubuntu-latest
     outputs:
-      environment:  ${{ steps.env.outputs.environment }}
-      image_suffix: ${{ steps.env.outputs.image_suffix }}
-      sha_short:    ${{ steps.env.outputs.sha_short }}
-      push:         ${{ steps.env.outputs.push }}
+      environment: ${{ steps.env.outputs.environment }}
+      sha_short:   ${{ steps.env.outputs.sha_short }}
+      push:        ${{ steps.env.outputs.push }}
     steps:
       - name: Resolve environment and tags
         id: env
@@ -85,10 +81,8 @@ jobs:
           DISPATCH_ENV="${{ github.event.inputs.environment }}"
           DISPATCH_PUSH="${{ github.event.inputs.push_image }}"
 
-          # Determine environment from branch or manual input.
           if   [[ "$REF" == "refs/heads/main"  || "$DISPATCH_ENV" == "main"  ]]; then ENV=main
           elif [[ "$REF" == "refs/heads/beta"  || "$DISPATCH_ENV" == "beta"  ]]; then ENV=beta
-          elif [[ "$REF" == "refs/heads/dev"   || "$DISPATCH_ENV" == "dev"   ]]; then ENV=dev
           else ENV=dev
           fi
 
@@ -96,12 +90,12 @@ jobs:
           PUSH="true"
           [[ "$DISPATCH_PUSH" == "false" ]] && PUSH="false"
 
-          echo "environment=$ENV"    >> "$GITHUB_OUTPUT"
-          echo "sha_short=$SHA"      >> "$GITHUB_OUTPUT"
-          echo "push=$PUSH"          >> "$GITHUB_OUTPUT"
+          echo "environment=$ENV" >> "$GITHUB_OUTPUT"
+          echo "sha_short=$SHA"   >> "$GITHUB_OUTPUT"
+          echo "push=$PUSH"       >> "$GITHUB_OUTPUT"
 
   # ─────────────────────────────────────────────────────────────────────────
-  # Build and push: Cairo (Next.js frontend)
+  # Build cairo (Next.js frontend)
   # ─────────────────────────────────────────────────────────────────────────
   build-cairo:
     name: "🌐 Build cairo"
@@ -110,20 +104,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up QEMU (for cross-compilation)
+      - name: Set up QEMU (cross-compilation for arm64)
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to ${{ env.REGISTRY }}
+      - name: Log in to registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # Gitea: use GITEA_TOKEN (auto-provisioned by acts_runner) or
+          # a personal access token stored as GITEA_REGISTRY_TOKEN.
+          # GitHub mirror: use GITHUB_TOKEN.
+          password: ${{ secrets.GITEA_REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}
 
-      - name: Extract Docker metadata
+      - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -144,20 +141,22 @@ jobs:
           push: ${{ needs.meta.outputs.push == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # type=gha is GitHub Actions cache — works on GitHub-hosted runners.
-          # On self-hosted runners without a cache backend, it silently falls
-          # back to no cache. Gitea uses type=local (see .gitea/workflows/docker.yml).
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Local cache — works without a cache backend.
+          # Switch to type=gha once Gitea cache backend is configured.
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
           build-args: |
             BUILD_ENV=${{ needs.meta.outputs.environment }}
             NODE_VERSION=22
 
-      - name: Output image digest
-        run: echo "Image digest for cairo ${{ steps.meta.outputs.tags }}"
+      # Prevent cache from growing unboundedly
+      - name: Rotate build cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache 2>/dev/null || true
 
   # ─────────────────────────────────────────────────────────────────────────
-  # Build and push: Cairo-backend (Express API)
+  # Build cairo-backend (Express API)
   # ─────────────────────────────────────────────────────────────────────────
   build-cairo-backend:
     name: "🖥️ Build cairo-backend"
@@ -172,14 +171,14 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to ${{ env.REGISTRY }}
+      - name: Log in to registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GITEA_REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}
 
-      - name: Extract Docker metadata
+      - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -200,44 +199,69 @@ jobs:
           push: ${{ needs.meta.outputs.push == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
           build-args: |
             BUILD_ENV=${{ needs.meta.outputs.environment }}
             NODE_VERSION=22
 
+      - name: Rotate build cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache 2>/dev/null || true
+
   # ─────────────────────────────────────────────────────────────────────────
-  # Sign images with Sigstore cosign (main branch only)
-  # This provides supply-chain provenance.
+  # Sign images with cosign (main branch only)
+  # Uses key-based signing — Gitea has no OIDC issuer for keyless signing.
+  #
+  # To enable:
+  #   1. Generate a cosign key pair:  cosign generate-key-pair
+  #   2. Store cosign.key contents as secret COSIGN_PRIVATE_KEY
+  #   3. Store cosign.pub as variable COSIGN_PUBLIC_KEY (for verification)
+  #   4. Store the key password as COSIGN_PASSWORD (or leave empty)
+  #
+  # If COSIGN_PRIVATE_KEY is not set, this job is skipped gracefully.
   # ─────────────────────────────────────────────────────────────────────────
   sign:
-    name: "🔏 Sign images (cosign)"
+    name: "🔏 Sign images (cosign key-based)"
     needs: [meta, build-cairo, build-cairo-backend]
     if: github.ref == 'refs/heads/main' && needs.meta.outputs.push == 'true'
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-      id-token: write   # Required for keyless signing via OIDC
     steps:
       - name: Install cosign
         uses: sigstore/cosign-installer@v3.7.0
 
-      - name: Log in to ${{ env.REGISTRY }}
+      - name: Log in to registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GITEA_REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}
 
-      - name: Sign cairo
+      - name: Sign cairo (key-based)
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD:    ${{ secrets.COSIGN_PASSWORD }}
         run: |
-          cosign sign --yes \
-            ${{ env.IMAGE_CAIRO }}@${{ needs.build-cairo.outputs.digest }} \
-            2>/dev/null || echo "::warning::cosign signing skipped (digest not available in output)"
+          if [ -z "$COSIGN_PRIVATE_KEY" ]; then
+            echo "::notice::COSIGN_PRIVATE_KEY not set — skipping image signing"
+            echo "To enable: cosign generate-key-pair and store cosign.key as COSIGN_PRIVATE_KEY"
+            exit 0
+          fi
+          echo "$COSIGN_PRIVATE_KEY" > /tmp/cosign.key
+          cosign sign --key /tmp/cosign.key --yes \
+            ${{ env.IMAGE_CAIRO }}:${{ needs.meta.outputs.sha_short }} \
+            2>/dev/null || echo "::warning::cosign signing failed"
+          rm -f /tmp/cosign.key
 
-      - name: Sign cairo-backend
+      - name: Sign cairo-backend (key-based)
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD:    ${{ secrets.COSIGN_PASSWORD }}
         run: |
-          cosign sign --yes \
-            ${{ env.IMAGE_CAIRO_BACKEND }}@${{ needs.build-cairo-backend.outputs.digest }} \
-            2>/dev/null || echo "::warning::cosign signing skipped"
+          if [ -z "$COSIGN_PRIVATE_KEY" ]; then exit 0; fi
+          echo "$COSIGN_PRIVATE_KEY" > /tmp/cosign.key
+          cosign sign --key /tmp/cosign.key --yes \
+            ${{ env.IMAGE_CAIRO_BACKEND }}:${{ needs.meta.outputs.sha_short }} \
+            2>/dev/null || echo "::warning::cosign signing failed"
+          rm -f /tmp/cosign.key
