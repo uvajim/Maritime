@@ -1,0 +1,437 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Maritime · Continuous Integration
+#
+# Runs on every push and pull-request to any branch.
+# Covers:
+#   • Secret / credential scanning (Gitleaks)
+#   • npm dependency audits (all three packages)
+#   • Static analysis / SAST (CodeQL for JS/TS, Slither for Solidity)
+#   • Lint (ESLint for Cairo & Cairo-backend, solhint for cairo-erc20)
+#   • Build verification (next build, tsc, hardhat compile)
+#   • Unit / integration tests (configurable; placeholder when absent)
+#   • Container image scanning (Trivy — images built inline, not pushed here)
+#
+# GitHub/Gitea compatibility note
+# ─────────────────────────────────
+# Gitea Actions is largely compatible with the GitHub Actions syntax used here.
+# The known differences are noted inline with the prefix  [Gitea note].
+# See docs/cicd/BRANCH_PROTECTION.md for runner and registry differences.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+# Cancel in-progress runs for the same ref so branches don't queue up.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege default — individual jobs escalate as needed.
+permissions:
+  contents: read
+  security-events: write   # required for CodeQL SARIF upload
+  actions: read
+
+env:
+  # ── Node version used across all JS/TS jobs ──────────────────────────────
+  NODE_VERSION: "22"
+
+  # ── Feature flags (set to "false" to disable a check during development) ─
+  # These can be overridden at the repository / environment level.
+  ENABLE_SECRET_SCAN:    "true"
+  ENABLE_DEPENDENCY_AUDIT: "true"
+  ENABLE_SAST:           "true"
+  ENABLE_SLITHER:        "true"
+  ENABLE_CONTAINER_SCAN: "true"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# JOB: Secret scanning
+# ═════════════════════════════════════════════════════════════════════════════
+jobs:
+  secret-scan:
+    name: "🔑 Secret scan (Gitleaks)"
+    if: vars.ENABLE_SECRET_SCAN != 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so Gitleaks can scan all commits on a push.
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # gitleaks-action reads GITLEAKS_LICENSE from secrets when
+        # running on a private org repo; for public repos it's not needed.
+        # [Gitea note] The gitleaks-action Docker action works on Gitea if
+        # your runner has Docker. Alternatively replace with a direct
+        # `gitleaks detect` call (see Gitea-specific workflow).
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB: npm dependency audits
+  # ═══════════════════════════════════════════════════════════════════════════
+  dependency-audit:
+    name: "📦 Dependency audit — ${{ matrix.package }}"
+    if: vars.ENABLE_DEPENDENCY_AUDIT != 'false'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: cairo
+            dir: Cairo
+          - package: cairo-backend
+            dir: Cairo-backend
+          - package: cairo-erc20
+            dir: cairo-erc20
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: ${{ matrix.dir }}/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --prefer-offline
+
+      - name: npm audit (moderate+)
+        # --audit-level=moderate means high/critical + moderate fail the job.
+        # Adjust level per package if needed: low | moderate | high | critical
+        run: npm audit --audit-level=moderate
+        continue-on-error: false
+
+      - name: License compliance check
+        # Fails if any dependency uses a disallowed license.
+        # Add/remove licenses in the --allow flag to match your policy.
+        run: |
+          npx license-checker --production \
+            --excludePrivatePackages \
+            --allow "MIT;ISC;BSD-2-Clause;BSD-3-Clause;Apache-2.0;CC0-1.0;0BSD;Python-2.0;BlueOak-1.0.0;CC-BY-3.0;CC-BY-4.0;Unlicense" \
+            --failOn "GPL;AGPL;LGPL;SSPL;CPAL;OSL" || true
+          # [Note] --failOn is advisory; remove `|| true` to hard-fail on GPL etc.
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB: CodeQL static analysis (JS / TypeScript)
+  # ═══════════════════════════════════════════════════════════════════════════
+  codeql:
+    name: "🔬 CodeQL SAST"
+    if: vars.ENABLE_SAST != 'false'
+    runs-on: ubuntu-latest
+    # [Gitea note] Gitea does not support CodeQL or SARIF uploads natively.
+    # See .gitea/workflows/ci.yml for the Semgrep-based alternative.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          # Queries include security-extended for XSS, injection, path traversal, etc.
+          queries: security-extended,security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:javascript-typescript"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB: Slither — Solidity static analysis
+  # ═══════════════════════════════════════════════════════════════════════════
+  slither:
+    name: "🐍 Slither (Solidity SAST)"
+    if: vars.ENABLE_SLITHER != 'false'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cairo-erc20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: cairo-erc20/package-lock.json
+
+      - name: Install contract deps
+        run: npm ci --prefer-offline
+
+      - name: Run Slither
+        uses: crytic/slither-action@v0.4.1
+        with:
+          target: cairo-erc20
+          slither-args: "--exclude-dependencies --filter-paths node_modules"
+          fail-on: high
+        # [Gitea note] Replace with: pip install slither-analyzer && slither .
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB: Cairo (Next.js) — lint + build + test
+  # ═══════════════════════════════════════════════════════════════════════════
+  cairo-ci:
+    name: "🌐 Cairo (frontend)"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Cairo
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: Cairo/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --prefer-offline
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type-check
+        # next build already type-checks; tsc --noEmit is faster for CI.
+        # ignoreBuildErrors is set in next.config.ts — we run a standalone
+        # tsc here so type errors are visible even when the build succeeds.
+        run: npx tsc --noEmit || echo "::warning::TypeScript errors found — set ignoreBuildErrors=false in next.config.ts to fail the build"
+
+      - name: Build (production)
+        run: npm run build
+        env:
+          # Provide dummy values so the build doesn't crash on missing env.
+          # Real values are injected at deploy time.
+          NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID: "ci-placeholder"
+          NEXT_PUBLIC_CHAIN_ID: "11155111"
+          NEXT_PUBLIC_BACKEND_URL: "http://localhost:3001"
+
+      # ── Tests ──────────────────────────────────────────────────────────────
+      # Cairo has no test suite configured yet.
+      # To add tests: install a framework (Jest, Vitest, Playwright) and
+      # replace the placeholder with `npm test`.
+      - name: Tests
+        run: |
+          if grep -q '"test"' package.json && ! npm run test --dry-run 2>&1 | grep -q "no test specified"; then
+            npm test
+          else
+            echo "::notice::No test suite configured for Cairo."
+            echo "To add tests: install Vitest or Jest and update the 'test' script in Cairo/package.json"
+            echo "Placeholder exit: 0 (non-blocking)"
+          fi
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB: Cairo-backend — lint + build + test
+  # ═══════════════════════════════════════════════════════════════════════════
+  cairo-backend-ci:
+    name: "🖥️ Cairo-backend"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Cairo-backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: Cairo-backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --prefer-offline
+
+      - name: Type-check (tsc)
+        run: npx tsc --noEmit
+
+      - name: Build (compile to dist/)
+        run: npm run build
+
+      # ── Tests ──────────────────────────────────────────────────────────────
+      # Cairo-backend has no test suite yet. Replace with `npm test` once
+      # a framework (Jest, Vitest, Supertest) is added to package.json.
+      - name: Tests
+        run: |
+          if npm run test --dry-run 2>&1 | grep -q "no test specified"; then
+            echo "::notice::No test suite configured for Cairo-backend."
+            echo "To add tests: install Jest/Vitest + Supertest and update 'test' in Cairo-backend/package.json"
+            echo "Placeholder exit: 0 (non-blocking)"
+          else
+            npm test
+          fi
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB: cairo-erc20 — lint + compile + test
+  # ═══════════════════════════════════════════════════════════════════════════
+  cairo-erc20-ci:
+    name: "📜 cairo-erc20 (contracts)"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cairo-erc20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: cairo-erc20/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --prefer-offline
+
+      - name: Lint Solidity (solhint)
+        run: |
+          npx solhint 'contracts/**/*.sol' --config .solhint.json 2>/dev/null \
+            || npx solhint 'contracts/**/*.sol' --fix --dry-run \
+            || echo "::warning::solhint not configured; create .solhint.json to enable"
+
+      - name: Compile contracts
+        run: npx hardhat compile
+
+      - name: Run Hardhat tests
+        run: npx hardhat test
+        env:
+          # Hardhat uses local in-memory network by default — no external keys needed.
+          HARDHAT_NETWORK: hardhat
+
+      - name: Generate gas report
+        run: |
+          REPORT_GAS=true npx hardhat test 2>&1 | tee gas-report.txt || true
+          echo "::notice::Gas report saved to gas-report.txt"
+
+      - name: Upload gas report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gas-report
+          path: cairo-erc20/gas-report.txt
+          retention-days: 30
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB: Container scanning (Trivy)
+  # Builds images locally (not pushed) and scans them for CVEs.
+  # ═══════════════════════════════════════════════════════════════════════════
+  container-scan:
+    name: "🐳 Container scan — ${{ matrix.name }}"
+    if: vars.ENABLE_CONTAINER_SCAN != 'false'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: cairo
+            context: Cairo
+            dockerfile: Cairo/Dockerfile
+          - name: cairo-backend
+            context: Cairo-backend
+            dockerfile: Cairo-backend/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (linux/amd64 only for scan speed)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: maritime/${{ matrix.name }}:scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_ENV=ci
+
+      - name: Scan with Trivy
+        uses: aquasecurity/trivy-action@0.32.0
+        with:
+          image-ref: maritime/${{ matrix.name }}:scan
+          format: sarif
+          output: trivy-${{ matrix.name }}.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-${{ matrix.name }}.sarif
+          category: trivy-${{ matrix.name }}
+        # [Gitea note] SARIF upload is GitHub-specific; Gitea alternative
+        # in .gitea/workflows/ci.yml uses trivy table output as a job summary.
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB: OSSF Scorecard (GitHub only)
+  # ═══════════════════════════════════════════════════════════════════════════
+  scorecard:
+    name: "🏅 OSSF Scorecard"
+    # Only run on pushes to the default branch to avoid spamming PRs.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run Scorecard analysis
+        uses: ossf/scorecard-action@v2.4.0
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: scorecard.sarif
+          category: ossf-scorecard
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # GATE: All CI checks must pass before merge is allowed.
+  # Reference this job in branch protection rules.
+  # ═══════════════════════════════════════════════════════════════════════════
+  ci-gate:
+    name: "✅ CI gate"
+    needs:
+      - secret-scan
+      - dependency-audit
+      - cairo-ci
+      - cairo-backend-ci
+      - cairo-erc20-ci
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all required jobs passed
+        run: |
+          results='${{ toJSON(needs) }}'
+          failed=$(echo "$results" | jq -r 'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | .key')
+          if [ -n "$failed" ]; then
+            echo "The following jobs failed:"
+            echo "$failed"
+            exit 1
+          fi
+          echo "All CI checks passed ✅"

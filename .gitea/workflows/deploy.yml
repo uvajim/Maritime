@@ -1,0 +1,164 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Maritime · Gitea Actions Deployment  (Gitea-specific)
+#
+# Gitea differences vs GitHub deploy.yml:
+#   ✗ GitHub Environments UI (approval gates) — Gitea v1.20+ has basic
+#     environment support but lacks manual-approval gates as of this writing.
+#     Workaround: protect branches so only maintainers can push (see docs).
+#   ✗ environment.url in the job — not displayed in Gitea UI yet.
+#   ✓ workflow_dispatch — supported since Gitea v1.20
+#   ✓ secrets / vars — supported; configure in Settings → Actions → Secrets
+#
+# GITEA NOTE ON ENVIRONMENTS:
+#   Gitea Actions environments (v1.22+) support secrets scoped to an
+#   environment name. Set secrets at:
+#     Settings → Actions → Secrets (for repo-level)
+#   Use GITEA_TOKEN instead of GITHUB_TOKEN for registry auth.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Deploy (Gitea)
+
+on:
+  push:
+    branches:
+      - dev
+      - beta
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [dev, beta, main]
+      deploy_frontend:
+        description: "Deploy Cairo (Vercel)"
+        required: false
+        default: "true"
+        type: boolean
+      deploy_backend:
+        description: "Deploy Cairo-backend (Railway)"
+        required: false
+        default: "true"
+        type: boolean
+      deploy_contracts:
+        description: "Deploy contracts"
+        required: false
+        default: "false"
+        type: boolean
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: "🚦 Branch guard"
+    runs-on: ubuntu-latest
+    outputs:
+      environment:       ${{ steps.resolve.outputs.environment }}
+      deploy_frontend:   ${{ steps.resolve.outputs.deploy_frontend }}
+      deploy_backend:    ${{ steps.resolve.outputs.deploy_backend }}
+      deploy_contracts:  ${{ steps.resolve.outputs.deploy_contracts }}
+    steps:
+      - name: Resolve environment
+        id: resolve
+        run: |
+          REF="${{ github.ref }}"
+          DISPATCH_ENV="${{ github.event.inputs.environment }}"
+
+          if   [[ "$REF" == "refs/heads/main" ]]; then ENV=main
+          elif [[ "$REF" == "refs/heads/beta" ]]; then ENV=beta
+          elif [[ "$REF" == "refs/heads/dev"  ]]; then ENV=dev
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then ENV="$DISPATCH_ENV"
+          else
+            echo "❌ Branch $REF is not a deployment branch."
+            exit 1
+          fi
+
+          echo "environment=$ENV" >> "$GITHUB_OUTPUT"
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "deploy_frontend=${{ github.event.inputs.deploy_frontend }}"   >> "$GITHUB_OUTPUT"
+            echo "deploy_backend=${{ github.event.inputs.deploy_backend }}"     >> "$GITHUB_OUTPUT"
+            echo "deploy_contracts=${{ github.event.inputs.deploy_contracts }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy_frontend=true"   >> "$GITHUB_OUTPUT"
+            echo "deploy_backend=true"    >> "$GITHUB_OUTPUT"
+            echo "deploy_contracts=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy-cairo:
+    name: "🌐 Deploy cairo → Vercel"
+    needs: guard
+    if: needs.guard.outputs.deploy_frontend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install -g vercel --silent
+      - name: Deploy
+        working-directory: Cairo
+        env:
+          VERCEL_TOKEN:      ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID:     ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+        run: |
+          vercel pull --yes --token="$VERCEL_TOKEN" \
+            --environment=${{ needs.guard.outputs.environment == 'main' && 'production' || 'preview' }}
+          FLAG=${{ needs.guard.outputs.environment == 'main' && '--prod' || '' }}
+          vercel build $FLAG --token="$VERCEL_TOKEN"
+          vercel deploy --prebuilt $FLAG --token="$VERCEL_TOKEN"
+
+  deploy-backend:
+    name: "🖥️ Deploy cairo-backend → Railway"
+    needs: guard
+    if: needs.guard.outputs.deploy_backend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm install -g @railway/cli --silent
+      - name: Deploy
+        working-directory: Cairo-backend
+        env:
+          RAILWAY_TOKEN:      ${{ secrets.RAILWAY_TOKEN }}
+          RAILWAY_SERVICE_ID: ${{ vars.RAILWAY_SERVICE_ID }}
+          RAILWAY_PROJECT_ID: ${{ vars.RAILWAY_PROJECT_ID }}
+        run: |
+          railway up \
+            --service "$RAILWAY_SERVICE_ID" \
+            --project "$RAILWAY_PROJECT_ID" \
+            --detach
+
+  deploy-contracts:
+    name: "📜 Deploy contracts"
+    needs: guard
+    if: needs.guard.outputs.deploy_contracts == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci --prefer-offline
+        working-directory: cairo-erc20
+      - run: npx hardhat compile
+        working-directory: cairo-erc20
+      - name: Deploy
+        working-directory: cairo-erc20
+        env:
+          SEPOLIA_RPC_URL:      ${{ secrets.SEPOLIA_RPC_URL }}
+          MAINNET_RPC_URL:      ${{ secrets.MAINNET_RPC_URL }}
+          DEPLOYER_PRIVATE_KEY: ${{ secrets.DEPLOYER_PRIVATE_KEY }}
+          USER_PRIVATE_KEY:     ${{ secrets.USER_PRIVATE_KEY }}
+          VAULT_PRIVATE_KEY:    ${{ secrets.VAULT_PRIVATE_KEY }}
+          ETHERSCAN_API_KEY:    ${{ secrets.ETHERSCAN_API_KEY }}
+        run: |
+          NETWORK=${{ needs.guard.outputs.environment == 'main' && 'mainnet' || 'sepolia' }}
+          npx hardhat run scripts/deploy-maritime-deposit.ts --network "$NETWORK"
+          npx hardhat run scripts/deploy-equity-vault.ts     --network "$NETWORK"
+          npx hardhat run scripts/deploy-overseer.ts         --network "$NETWORK"
+          npx hardhat run scripts/deploy-trade-executor.ts   --network "$NETWORK"
+          npx hardhat run scripts/grant-roles.ts             --network "$NETWORK"

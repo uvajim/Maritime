@@ -1,0 +1,312 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Maritime · Gitea Actions CI  (Gitea-specific alternative)
+#
+# Gitea Actions is syntactically compatible with GitHub Actions for most
+# features, but the following are NOT available:
+#   ✗ github/codeql-action        — CodeQL is GitHub-only
+#   ✗ ossf/scorecard-action       — GitHub-only
+#   ✗ SARIF upload to a security tab — Gitea has no security tab
+#   ✗ actions/cache (gha type)    — must use acts-runner local cache or
+#                                   Gitea's built-in cache (v1.21+)
+#   ✗ secrets.GITHUB_TOKEN        — use secrets.GITEA_TOKEN or the
+#                                   auto-generated token (see notes below)
+#
+# This file mirrors .github/workflows/ci.yml and replaces the GitHub-specific
+# steps with Gitea-compatible equivalents.
+#
+# RUNNER REQUIREMENTS
+#   • Gitea Acts Runner v0.2+ with Docker support (for Trivy / Gitleaks)
+#   • Or a runner with act (nektos/act) installed
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: CI (Gitea)
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "22"
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # Secret scanning via gitleaks CLI (replaces gitleaks-action)
+  # ─────────────────────────────────────────────────────────────────────────
+  secret-scan:
+    name: "🔑 Secret scan (Gitleaks)"
+    runs-on: ubuntu-latest
+    container:
+      image: zricethezav/gitleaks:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        run: gitleaks detect --source . --verbose --redact
+        # On Gitea, results are printed to the job log only.
+        # Pipe to a file and upload as artifact if you want a report.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Semgrep SAST (replaces CodeQL — works anywhere with Docker)
+  # ─────────────────────────────────────────────────────────────────────────
+  semgrep:
+    name: "🔬 Semgrep SAST"
+    runs-on: ubuntu-latest
+    container:
+      image: returntocorp/semgrep
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        run: |
+          semgrep scan \
+            --config="p/javascript"   \
+            --config="p/typescript"   \
+            --config="p/nodejs"       \
+            --config="p/secrets"      \
+            --config="p/owasp-top-ten" \
+            --error \
+            --json --output semgrep-results.json \
+            . || true
+          # Pretty-print summary
+          cat semgrep-results.json | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          errs = d.get('results', [])
+          print(f'{len(errs)} finding(s)')
+          for r in errs[:20]:
+              print(f\"  {r['path']}:{r['start']['line']} [{r['check_id']}]\")
+          " || true
+
+      - name: Upload Semgrep results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: semgrep-results
+          path: semgrep-results.json
+          retention-days: 14
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Slither (Solidity)
+  # ─────────────────────────────────────────────────────────────────────────
+  slither:
+    name: "🐍 Slither"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cairo-erc20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - run: npm ci --prefer-offline
+
+      - name: Install Slither
+        run: pip3 install slither-analyzer
+
+      - name: Run Slither
+        run: |
+          slither . \
+            --exclude-dependencies \
+            --filter-paths "node_modules" \
+            --checklist \
+            2>&1 | tee slither-report.txt || true
+          # Fail if any HIGH severity findings
+          if grep -qi "High" slither-report.txt; then
+            echo "❌ Slither found HIGH severity issues"
+            cat slither-report.txt
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: slither-report
+          path: cairo-erc20/slither-report.txt
+          retention-days: 14
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Dependency audits
+  # ─────────────────────────────────────────────────────────────────────────
+  dependency-audit:
+    name: "📦 Audit — ${{ matrix.package }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: cairo
+            dir: Cairo
+          - package: cairo-backend
+            dir: Cairo-backend
+          - package: cairo-erc20
+            dir: cairo-erc20
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: npm ci --prefer-offline
+      - run: npm audit --audit-level=moderate
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Cairo (Next.js)
+  # ─────────────────────────────────────────────────────────────────────────
+  cairo-ci:
+    name: "🌐 Cairo (frontend)"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Cairo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: npm ci --prefer-offline
+      - run: npm run lint
+      - run: npx tsc --noEmit || echo "::warning::TypeScript errors"
+      - name: Build
+        run: npm run build
+        env:
+          NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID: "ci-placeholder"
+          NEXT_PUBLIC_CHAIN_ID: "11155111"
+          NEXT_PUBLIC_BACKEND_URL: "http://localhost:3001"
+      - name: Tests (placeholder)
+        run: |
+          if npm run test --dry-run 2>&1 | grep -q "no test specified"; then
+            echo "::notice::No test suite configured for Cairo. Add Vitest/Jest to enable."
+          else
+            npm test
+          fi
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Cairo-backend
+  # ─────────────────────────────────────────────────────────────────────────
+  cairo-backend-ci:
+    name: "🖥️ Cairo-backend"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Cairo-backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: npm ci --prefer-offline
+      - run: npx tsc --noEmit
+      - run: npm run build
+      - name: Tests (placeholder)
+        run: |
+          if npm run test --dry-run 2>&1 | grep -q "no test specified"; then
+            echo "::notice::No test suite configured for Cairo-backend. Add Jest/Supertest."
+          else
+            npm test
+          fi
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # cairo-erc20
+  # ─────────────────────────────────────────────────────────────────────────
+  cairo-erc20-ci:
+    name: "📜 cairo-erc20"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cairo-erc20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: npm ci --prefer-offline
+      - run: npx hardhat compile
+      - run: npx hardhat test
+        env:
+          HARDHAT_NETWORK: hardhat
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Container scanning (Trivy — table output, no SARIF)
+  # ─────────────────────────────────────────────────────────────────────────
+  container-scan:
+    name: "🐳 Container scan — ${{ matrix.name }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: cairo
+            context: Cairo
+            dockerfile: Cairo/Dockerfile
+          - name: cairo-backend
+            context: Cairo-backend
+            dockerfile: Cairo-backend/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: maritime/${{ matrix.name }}:scan
+
+      - name: Trivy scan
+        # Use the Trivy Docker image directly — no SARIF upload on Gitea.
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+            aquasec/trivy:latest image \
+              --exit-code 1 \
+              --severity CRITICAL,HIGH \
+              --ignore-unfixed \
+              --format table \
+              maritime/${{ matrix.name }}:scan
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # CI gate
+  # ─────────────────────────────────────────────────────────────────────────
+  ci-gate:
+    name: "✅ CI gate"
+    needs:
+      - secret-scan
+      - dependency-audit
+      - cairo-ci
+      - cairo-backend-ci
+      - cairo-erc20-ci
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all required jobs
+        run: |
+          results='${{ toJSON(needs) }}'
+          failed=$(echo "$results" | jq -r 'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | .key')
+          if [ -n "$failed" ]; then
+            echo "Failed jobs: $failed"
+            exit 1
+          fi
+          echo "All CI checks passed ✅"

@@ -1,0 +1,14 @@
+{
+  "extends": "solhint:recommended",
+  "rules": {
+    "avoid-suicide": "error",
+    "avoid-sha3": "warn",
+    "no-unused-vars": "warn",
+    "func-visibility": ["warn", { "ignoreConstructors": true }],
+    "state-visibility": "warn",
+    "max-line-length": ["warn", 150],
+    "compiler-version": ["warn", "^0.8.28"],
+    "reason-string": "warn",
+    "custom-errors": "warn"
+  }
+}

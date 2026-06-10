@@ -1,0 +1,64 @@
+# ── Environment files ─────────────────────────────────────────────────────────
+# NEVER commit real environment files. Use .env.example as templates.
+.env
+.env.local
+.env.*.local
+
+# Allow example files (no real values)
+!.env.example
+!Cairo/.env.example
+!Cairo-backend/.env.example
+!cairo-erc20/.env.example
+
+# Allow committed dev/production env templates (no real secrets)
+!Cairo/.env.development
+!Cairo/.env.production
+
+# ── Node.js ───────────────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm/
+
+# ── Build outputs ─────────────────────────────────────────────────────────────
+dist/
+build/
+out/
+.next/
+.turbo/
+.output/
+
+# ── Hardhat / Solidity ────────────────────────────────────────────────────────
+cairo-erc20/artifacts/
+cairo-erc20/cache/
+cairo-erc20/typechain/
+cairo-erc20/typechain-types/
+cairo-erc20/.deps/
+
+# ── OS / Editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Coverage / test artifacts ─────────────────────────────────────────────────
+coverage/
+.nyc_output/
+gas-report.txt
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+# Don't ignore docker-compose.yml (it's part of the repo)
+# But ignore local overrides
+docker-compose.override.yml
+docker-compose.local.yml
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+*.log
+*.pid
+*.seed
+*.pid.lock
+.vercel/
+.railway/

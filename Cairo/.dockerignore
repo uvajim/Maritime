@@ -1,0 +1,50 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Cairo — .dockerignore
+# Keeps the build context small and prevents secrets leaking into the image.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Dependencies (always reinstalled in the image)
+node_modules/
+.npm/
+
+# Build outputs (rebuilt inside Docker)
+.next/
+out/
+dist/
+
+# Environment files (NEVER in the image — inject at runtime)
+.env
+.env.*
+!.env.example
+
+# Git & CI
+.git/
+.gitignore
+.github/
+.gitea/
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+
+# Test artifacts
+coverage/
+.nyc_output/
+
+# Docs
+docs/
+*.md
+!README.md
+
+# Misc
+Dockerfile*
+docker-compose*
+.dockerignore
+frontend/

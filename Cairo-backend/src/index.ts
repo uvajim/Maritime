@@ -11,6 +11,11 @@ const app = express();
 app.use(helmet());
 app.use(express.json());
 
+// Health check — used by Docker HEALTHCHECK and the CI smoke-test job.
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", ts: Date.now() });
+});
+
 app.use("/api/trade",             offersRouter);
 app.use("/api/balances",          balancesRouter);
 app.use("/api/tickers",           tickersRouter);

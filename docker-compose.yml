@@ -1,0 +1,142 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Maritime — Local Development Docker Compose
+#
+# Usage:
+#   cp Cairo/.env.example             Cairo/.env.local
+#   cp Cairo-backend/.env.example     Cairo-backend/.env.local
+#   docker compose up --build
+#
+# Services:
+#   cairo          — Next.js frontend (http://localhost:3000)
+#   cairo-backend  — Express API      (http://localhost:3001)
+#   redis          — Cache / queue    (localhost:6379)
+#   postgres       — Database         (localhost:5432)
+#
+# Profiles:
+#   --profile full     → start all services including postgres and redis
+#   (default)          → starts only cairo + cairo-backend + redis
+#
+# Environment variable precedence:
+#   1. Shell environment
+#   2. .env file in the project root (root .env for compose-level vars)
+#   3. Each service's env_file (.env.local within each package)
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: maritime
+
+services:
+  # ── Cairo: Next.js frontend ────────────────────────────────────────────────
+  cairo:
+    build:
+      context: Cairo
+      dockerfile: Dockerfile
+      args:
+        BUILD_ENV: development
+    image: maritime-cairo:local
+    container_name: maritime-cairo
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: development
+      NEXT_PUBLIC_BACKEND_URL: http://cairo-backend:3001
+      # Override with values from env_file; real secrets never committed.
+    env_file:
+      - path: Cairo/.env.local
+        required: false
+      - path: Cairo/.env.development
+        required: false
+    depends_on:
+      cairo-backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - maritime-net
+    # Development: mount source for hot reload (optional)
+    # volumes:
+    #   - ./Cairo:/app
+    #   - /app/node_modules
+    #   - /app/.next
+
+  # ── Cairo-backend: Express API ─────────────────────────────────────────────
+  cairo-backend:
+    build:
+      context: Cairo-backend
+      dockerfile: Dockerfile
+      args:
+        BUILD_ENV: development
+    image: maritime-cairo-backend:local
+    container_name: maritime-cairo-backend
+    ports:
+      - "3001:3001"
+    environment:
+      NODE_ENV: development
+      PORT: "3001"
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://maritime:maritime@postgres:5432/maritime
+    env_file:
+      - path: Cairo-backend/.env.local
+        required: false
+      - path: Cairo-backend/.env.example
+        required: false
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - maritime-net
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: maritime-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - maritime-net
+    volumes:
+      - redis-data:/data
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: maritime-postgres
+    profiles:
+      - full
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER:     maritime
+      POSTGRES_PASSWORD: maritime
+      POSTGRES_DB:       maritime
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U maritime"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - maritime-net
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+networks:
+  maritime-net:
+    driver: bridge
+
+volumes:
+  redis-data:
+  postgres-data:
