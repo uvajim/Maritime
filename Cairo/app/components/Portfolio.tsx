@@ -1,0 +1,431 @@
+"use client";
+
+import { useState, useEffect, useRef, useCallback } from "react";
+import Image from "next/image";
+import { Link } from "react-router";
+import { useTranslation } from "react-i18next";
+import { PortfolioChart } from "./PortfolioChart";
+import { Watchlist } from "./Watchlist";
+import { usePublicClient, useSignMessage } from "wagmi";
+import { useWallet } from "../contexts/WalletContext";
+import { EQUITY_VAULT_ADDRESS, EQUITY_VAULT_ABI, CHAIN_ID, PORTFOLIO_BALANCE_API_URL } from "../lib/config";
+import { DepositMethodModal } from "./DepositMethodModal";
+import { holdingsCache } from "../lib/holdingsCache";
+import { useCurrency } from "../contexts/CurrencyContext";
+
+function HoldingRow({ ticker, qty, price, total }: { ticker: string; qty: number; price: number; total: number }) {
+  const { t } = useTranslation();
+  const { formatPrice } = useCurrency();
+  const [imgError, setImgError] = useState(false);
+  return (
+      <Link to={`/stock/${ticker}`} className="flex items-center justify-between py-3 border-b border-default last:border-0 hover-surface -mx-1 px-1 rounded-lg transition-colors">
+        <div className="flex items-center gap-3">
+          {!imgError ? (
+              <Image
+                  src={`https://assets.parqet.com/logos/symbol/${ticker}?format=png`}
+                  alt={ticker}
+                  width={36}
+                  height={36}
+                  unoptimized
+                  className="rounded-full surface-3 object-cover"
+                  onError={() => setImgError(true)}
+              />
+          ) : (
+              <div className="w-9 h-9 rounded-full surface-3 flex items-center justify-center text-xs font-bold">
+                {ticker[0]}
+              </div>
+          )}
+          <div>
+            <p className="text-sm font-bold">{ticker}</p>
+            <p className="text-xs text-muted">{t("portfolio.shares", { count: qty })}</p>
+          </div>
+        </div>
+        <div className="text-right">
+          <p className="text-sm font-bold">
+            {total > 0 ? formatPrice(total) : "—"}
+          </p>
+          <p className="text-xs text-muted">
+            {price > 0 ? `${formatPrice(price)} ${t("portfolio.perShare")}` : "—"}
+          </p>
+        </div>
+      </Link>
+  );
+}
+
+const timeRanges = ["1D", "1W", "1M", "3M", "1Y"];
+
+const RANGE_DAYS: Record<string, number> = {
+  "1D": 1, "1W": 7, "1M": 30, "3M": 90, "1Y": 365,
+};
+
+// Chart cache keyed by wallet+range
+const chartCache: Record<string, { time: string; value: number }[]> = {};
+
+export function Portfolio() {
+  const { t } = useTranslation();
+  const { formatPrice } = useCurrency();
+  const [selectedRange, setSelectedRange] = useState("1D");
+  const [hoveredPrice, setHoveredPrice]   = useState<number | null>(null);
+  const [hoveredTime,  setHoveredTime]    = useState<string | null>(null);
+  const [chartPoints,  setChartPoints]    = useState<{ time: string; value: number }[]>([]);
+  const [chartLoading, setChartLoading]   = useState(false);
+
+  // Rely strictly on the context!
+  const { address, accountBalance } = useWallet();
+  const publicClient = usePublicClient({ chainId: CHAIN_ID });
+  const { signMessageAsync } = useSignMessage();
+
+  // Perform the challenge/sign/verify handshake. The session is stored as an
+  // HttpOnly cookie by the browser — JS never sees or stores the token.
+  const acquireSession = useCallback(async (addr: string): Promise<boolean> => {
+    try {
+      const cr = await fetch(`${PORTFOLIO_BALANCE_API_URL}/auth/challenge`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address: addr }),
+        credentials: "include",
+      });
+      if (!cr.ok) return false;
+      const { nonce, message } = await cr.json();
+      const signature = await signMessageAsync({ message });
+      const vr = await fetch(`${PORTFOLIO_BALANCE_API_URL}/auth/verify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address: addr, nonce, signature }),
+        credentials: "include",
+      });
+      return vr.ok;
+    } catch {
+      return false;
+    }
+  }, [signMessageAsync]);
+
+  // Holdings — seed from shared cache instantly, but only if the cache belongs to
+  // the currently-connected wallet (otherwise stale holdings from a previously
+  // viewed address would be counted into the total).
+  const seededHoldings = holdingsCache.address === address ? holdingsCache.holdings : {};
+  const seededPrices   = holdingsCache.address === address ? holdingsCache.prices   : {};
+  const [holdings,      setHoldings]      = useState<Record<string, number>>(seededHoldings);
+  const [holdingPrices, setHoldingPrices] = useState<Record<string, number>>(seededPrices);
+
+  useEffect(() => {
+    if (!address || !publicClient) { setHoldings({}); setHoldingPrices({}); return; }
+    let cancelled = false;
+
+    const fetchHoldings = async () => {
+      try {
+        const count = await publicClient.readContract({
+          address:      EQUITY_VAULT_ADDRESS,
+          abi:          EQUITY_VAULT_ABI,
+          functionName: 'tickerCount',
+        }) as bigint;
+
+        const tickerCalls = Array.from({ length: Number(count) }, (_, i) => ({
+          address:      EQUITY_VAULT_ADDRESS,
+          abi:          EQUITY_VAULT_ABI,
+          functionName: 'allTickers' as const,
+          args:         [BigInt(i)] as const,
+        }));
+        const tickerResults = count > 0n
+          ? await publicClient.multicall({ contracts: tickerCalls })
+          : [];
+        const tickers = tickerResults
+          .map(r => r.status === 'success' ? (r.result as string) : null)
+          .filter((t): t is string => t !== null);
+
+        const balanceCalls = tickers.map(ticker => ({
+          address:      EQUITY_VAULT_ADDRESS,
+          abi:          EQUITY_VAULT_ABI,
+          functionName: 'balanceOfTicker' as const,
+          args:         [address as `0x${string}`, ticker] as const,
+        }));
+        const balanceResults = tickers.length > 0
+          ? await publicClient.multicall({ contracts: balanceCalls })
+          : [];
+
+        const h: Record<string, number> = {};
+        balanceResults.forEach((r, i) => {
+          if (r.status === 'success' && (r.result as bigint) > 0n)
+            h[tickers[i]] = Number(r.result as bigint) / 1_000_000;
+        });
+
+        if (cancelled) return;
+        setHoldings(h);
+
+        const heldTickers = Object.keys(h);
+        if (heldTickers.length === 0) return;
+
+        const snapRes  = await fetch(`/api/market/snapshots?symbols=${heldTickers.join(",")}`);
+        const snapData = await snapRes.json();
+        if (cancelled) return;
+
+        const prices: Record<string, number> = {};
+        for (const ticker of heldTickers) {
+          prices[ticker] = snapData[ticker]?.price ?? 0;
+        }
+        setHoldingPrices(prices);
+        holdingsCache.address  = address;
+        holdingsCache.holdings = h;
+        holdingsCache.prices   = prices;
+      } catch { /* keep previous */ }
+    };
+
+    fetchHoldings();
+    const id = setInterval(fetchHoldings, 30_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [address, publicClient]);
+
+  const [showDepositModal, setShowDepositModal] = useState(false);
+  const [storedPortfolioBalance, setStoredPortfolioBalance] = useState<number | null>(null);
+  const [accountCreatedAt, setAccountCreatedAt] = useState<string | null>(null);
+  const lastSyncedBalanceRef = useRef<number | null>(null);
+
+  // Uses the fixed value from WalletContext
+  const holdingsValue  = Object.entries(holdings).reduce((sum, [ticker, qty]) => sum + qty * (holdingPrices[ticker] ?? 0), 0);
+  const portfolioValue = address ? accountBalance + holdingsValue : 0;
+
+  // Fetch current cached balance from Redis (via backend)
+  useEffect(() => {
+    if (!address) {
+      setStoredPortfolioBalance(null);
+      setAccountCreatedAt(null);
+      lastSyncedBalanceRef.current = null;
+      return;
+    }
+
+    let cancelled = false;
+    fetch(`${PORTFOLIO_BALANCE_API_URL}/${address}`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (cancelled) return;
+        const value = typeof data?.balance === "number" ? data.balance : null;
+        setStoredPortfolioBalance(value);
+        lastSyncedBalanceRef.current = value;
+      })
+      .catch(() => { /* keep local value */ });
+
+    // Fetch earliest snapshot time to determine account age (for timeframe gating)
+    fetch(`${PORTFOLIO_BALANCE_API_URL}/${address}/history?days=365`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (cancelled) return;
+        const firstPoint = data?.points?.[0];
+        if (firstPoint?.time) setAccountCreatedAt(firstPoint.time);
+      })
+      .catch(() => {});
+
+    return () => { cancelled = true; };
+  }, [address]);
+
+  // Push locally-computed portfolio value to TSDB (price-change-driven snapshots)
+  useEffect(() => {
+    if (!address) return;
+    if (!Number.isFinite(portfolioValue)) return;
+
+    const roundedBalance = Math.round(portfolioValue * 100) / 100;
+    if (lastSyncedBalanceRef.current !== null && Math.abs(lastSyncedBalanceRef.current - roundedBalance) < 0.01) {
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      const putSnapshot = async () => fetch(`${PORTFOLIO_BALANCE_API_URL}/${address}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ balance: roundedBalance, clientTime: new Date().toISOString() }),
+        credentials: "include",
+      }).catch(() => null);
+
+      let res = await putSnapshot();
+      if (!res) return;
+
+      // No valid session cookie — sign in once then retry.
+      if (res.status === 401) {
+        const ok = await acquireSession(address);
+        if (!ok) return;
+        res = await putSnapshot();
+        if (!res || res.status !== 200) return;
+      }
+
+      const data = await res.json().catch(() => null);
+      if (!data) return;
+      const value = typeof data?.balance === "number" ? data.balance : roundedBalance;
+      lastSyncedBalanceRef.current = value;
+      setStoredPortfolioBalance(value);
+    }, 600);
+
+    return () => clearTimeout(timer);
+  }, [address, portfolioValue, acquireSession]);
+
+  const chartColor =
+      chartPoints.length >= 2 &&
+      chartPoints[chartPoints.length - 1].value >= chartPoints[0].value
+          ? "#00c805"
+          : "#ff5000";
+
+  useEffect(() => {
+    if (!address) {
+      setChartPoints([]);
+      setChartLoading(false);
+      return;
+    }
+
+    const cacheKey = `${address.toLowerCase()}::${selectedRange}`;
+    if (chartCache[cacheKey]) {
+      setChartPoints(chartCache[cacheKey]);
+      setChartLoading(false);
+      return;
+    }
+    setChartPoints([]);
+    setChartLoading(true);
+    const days = RANGE_DAYS[selectedRange] ?? 1;
+    fetch(`${PORTFOLIO_BALANCE_API_URL}/${address}/history?days=${days}`)
+        .then(r => r.json())
+        .then(data => {
+          const points = (data.points ?? []).map(
+              (p: { time: string; value: number }) => ({
+                time: new Date(p.time).toLocaleString("en-US", {
+                  month: "short",
+                  day: "numeric",
+                  hour: "numeric",
+                  minute: "2-digit",
+                }),
+                value: Math.round(p.value * 100) / 100,
+              })
+          );
+          chartCache[cacheKey] = points;
+          setChartPoints(points);
+        })
+        .catch(() => {})
+        .finally(() => setChartLoading(false));
+  }, [selectedRange, address]);
+
+  // Headline always reflects the live value: dUSD balance + Σ(holding qty × price).
+  // (storedPortfolioBalance is a cached snapshot used only for chart history /
+  // push de-duplication; preferring it here showed a stale, inflated total.)
+  const displayValue = hoveredPrice ?? portfolioValue;
+  // When there isn't enough stored history, synthesize a flat baseline from the
+  // current portfolio value so the chart always renders with the correct number.
+  const displayChartPoints = chartPoints.length >= 2 ? chartPoints : (() => {
+    const val  = Math.round(portfolioValue * 100) / 100;
+    const fmt  = (d: Date) => d.toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+    const now  = new Date();
+    const days = RANGE_DAYS[selectedRange] ?? 1;
+    const then = new Date(now.getTime() - days * 86_400_000);
+    return [{ time: fmt(then), value: val }, { time: fmt(now), value: val }];
+  })();
+  const hasEnoughHistory = displayChartPoints.length >= 2;
+
+
+  return (
+      <div className="app-bg app-fg font-sans selection:bg-gray-800">
+        <div className="max-w-[1024px] mx-auto px-6 py-8 grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-12">
+
+          <div className="flex flex-col">
+            <header className="mb-6 relative">
+              <div className="flex justify-between items-start mb-1">
+                <div className="flex items-center gap-1 cursor-pointer group w-fit">
+                  <h1 className="text-xl font-medium transition-colors">{t("overview.title")}</h1>
+                </div>
+              </div>
+
+              <div>
+                <h2 className="text-4xl font-bold tracking-tight mb-1">
+                  {formatPrice(displayValue)}
+                </h2>
+                {hoveredTime && (
+                  <p className="text-xs text-muted">At {hoveredTime}</p>
+                )}
+              </div>
+            </header>
+
+            <div className="mb-8 relative">
+              {chartLoading ? (
+                  <div className="h-[280px] w-full surface-3 animate-pulse rounded-xl" />
+              ) : (
+                  <>
+                    <PortfolioChart
+                        color={chartColor}
+                        showReferenceLine={false}
+                        data={displayChartPoints}
+                        onHover={(v, t) => { setHoveredPrice(v); setHoveredTime(t); }}
+                    />
+                    {!hasEnoughHistory && (
+                      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                        <div className="px-3 py-1.5 rounded-full surface-3 border border-default text-xs text-muted">
+                          {t("portfolio.noHistory")}
+                        </div>
+                      </div>
+                    )}
+                  </>
+              )}
+              <div className="flex justify-between items-center mt-6 border-b border-default pb-4">
+                <div className="flex gap-1">
+                  {timeRanges.map((range) => (
+                      <button
+                          key={range}
+                          onClick={() => setSelectedRange(range)}
+                          className="px-3 py-1 text-xs font-bold rounded transition-colors hover-surface"
+                          style={{ color: selectedRange === range ? chartColor : "#9CA3AF" }}
+                      >
+                        {range}
+                      </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {showDepositModal && (
+              <DepositMethodModal onClose={() => setShowDepositModal(false)} />
+            )}
+
+            {address && (
+                <div className="mb-8">
+                  <div className="flex items-center justify-between py-4 border-b border-default">
+                    <div>
+                      <p className="text-xs text-soft uppercase tracking-widest mb-0.5">{t("overview.buyingPower")}</p>
+                      <p className="text-lg font-bold">
+                        {formatPrice(accountBalance)}
+                      </p>
+                    </div>
+                    <button
+                        onClick={() => setShowDepositModal(true)}
+                        className="bg-white text-black text-sm font-bold px-4 py-2 rounded-full hover:bg-gray-200 transition-colors"
+                    >
+                      {t("overview.deposit")}
+                    </button>
+                  </div>
+                </div>
+            )}
+
+            {address && Object.keys(holdings).length > 0 && (
+                <div className="mb-8">
+                  <Link to="/portfolio" className="text-base font-semibold mb-3 text-muted transition-colors inline-block">{t("overview.holdings")}</Link>
+                  <div className="space-y-2">
+                    {Object.entries(holdings).map(([ticker, qty]) => {
+                      const price = holdingPrices[ticker] ?? 0;
+                      const total = qty * price;
+                      return (
+                          <HoldingRow key={ticker} ticker={ticker} qty={qty} price={price} total={total} />
+                      );
+                    })}
+                  </div>
+                </div>
+            )}
+
+            {!address && (
+                <div className="flex flex-col items-center justify-center py-16 text-center border border-default rounded-2xl">
+                  <p className="text-muted text-sm mb-4">{t("overview.connectPrompt")}</p>
+                </div>
+            )}
+
+          </div>
+
+          <div className="hidden lg:block pl-6">
+            <div className="sticky top-24">
+              <Watchlist />
+            </div>
+          </div>
+        </div>
+      </div>
+  );
+}

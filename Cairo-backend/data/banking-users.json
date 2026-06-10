@@ -1,0 +1,10 @@
+{
+  "test@maritime.com": {
+    "id": "5280a7ab-5c72-492b-b444-aeca424172b9",
+    "email": "test@maritime.com",
+    "name": "Test User",
+    "passwordHash": "$2b$12$GvSXimwLSBew7OY/Jirn8.Qmje0EdSlZnST5MaCeVixFD.cYGGvpK",
+    "createdAt": "2026-04-16T18:46:41.073Z",
+    "customerId": "ec7f61ef-7eed-43ed-a7a6-80b2d4cbcafc"
+  }
+}
