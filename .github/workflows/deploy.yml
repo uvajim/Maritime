@@ -13,22 +13,18 @@
 # Architecture
 # ────────────
 # Frontend (Vercel):
-#   Vercel is the source of truth for its own environment variables.
-#   Configure them once in the Vercel dashboard (or via `vercel env add`
-#   locally). The CI job only authenticates and calls `vercel deploy` —
-#   it does NOT push vars from GitHub into Vercel. The VERCEL_TOKEN must
-#   be a Vercel personal access token (vercel.com/account/tokens), NOT
-#   the VERCEL_OIDC_TOKEN injected into serverless functions at runtime.
+#   Vercel env vars are managed by vercel-env.yml using vercel env ls/add/rm.
+#   This job only authenticates + vercel pull → vercel build → vercel deploy.
+#   VERCEL_TOKEN must be a personal access token (vercel.com/account/tokens).
 #
 # Backend (Railway):
-#   Railway is the source of truth for its own service variables.
-#   Configure them in the Railway dashboard. The CI job authenticates
-#   and calls `railway up`. No variable pushing.
+#   Railway dashboard is the source of truth for service env vars.
+#   This job only authenticates and calls `railway up`.
 #
 # Contracts (Hardhat):
-#   Only redeploys when .sol files changed in this push, or when
-#   deploy_contracts=true is set explicitly via workflow_dispatch.
-#   Never auto-redeploys when only JS/TS/config files changed.
+#   Only redeploys when .sol files or hardhat.config.ts changed in this push,
+#   or when deploy_contracts=true is set via workflow_dispatch.
+#   Mainnet auto-deploy on push is always blocked — requires workflow_dispatch.
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Deploy

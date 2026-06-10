@@ -1,0 +1,248 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Maritime · Vercel Environment Variable Management
+#
+# Manages Vercel environment variables entirely through the Vercel CLI:
+#   vercel env ls      — audit what is set
+#   vercel env add     — add a missing variable
+#   vercel env rm      — remove a stale variable
+#
+# This workflow is the ONLY place env vars are written to Vercel.
+# GitHub Actions is used purely as the secure credential store and
+# execution context — the Vercel project is the source of truth.
+#
+# Vercel environments mapped from our branch model:
+#   dev   → preview  (Vercel "preview" environment)
+#   beta  → preview  (same Vercel environment, different branch alias)
+#   main  → production
+#
+# Triggered by:
+#   • Push to dev/beta/main when Cairo/ files change
+#   • Manual dispatch (to add/remove/audit vars at any time)
+#
+# Required GitHub secret (all three environments):
+#   VERCEL_TOKEN  — personal access token from vercel.com/account/tokens
+#
+# Required GitHub variables:
+#   VERCEL_ORG_ID, VERCEL_PROJECT_ID
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Vercel Env Vars
+
+on:
+  push:
+    branches: [dev, beta, main]
+    paths:
+      - "Cairo/**"
+      - ".github/workflows/vercel-env.yml"
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [dev, beta, main]
+      action:
+        description: "Action to perform"
+        required: true
+        type: choice
+        options:
+          - audit       # list all vars set in Vercel, check required ones exist
+          - sync        # add missing vars, update changed ones
+          - remove      # remove a single variable (requires var_name input)
+      var_name:
+        description: "Variable name (only for remove action)"
+        required: false
+        type: string
+
+concurrency:
+  group: vercel-env-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  vercel-env:
+    name: "🔧 Vercel env [${{ github.event.inputs.action || 'sync' }}] → ${{ github.event.inputs.environment || (github.ref == 'refs/heads/main' && 'main') || (github.ref == 'refs/heads/beta' && 'beta') || 'dev' }}"
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || (github.ref == 'refs/heads/main' && 'main') || (github.ref == 'refs/heads/beta' && 'beta') || 'dev' }}
+    steps:
+      - name: Install Vercel CLI
+        run: npm install -g vercel@latest --silent
+
+      # ── Resolve Vercel target environment ──────────────────────────────────
+      - name: Resolve Vercel target
+        id: ctx
+        run: |
+          # Map our branch/environment names to Vercel target environments
+          BRANCH_ENV="${{ github.event.inputs.environment }}"
+          if [ -z "$BRANCH_ENV" ]; then
+            case "${{ github.ref }}" in
+              refs/heads/main) BRANCH_ENV=main ;;
+              refs/heads/beta) BRANCH_ENV=beta ;;
+              *)               BRANCH_ENV=dev  ;;
+            esac
+          fi
+
+          case "$BRANCH_ENV" in
+            main) VERCEL_TARGET=production ;;
+            *)    VERCEL_TARGET=preview    ;;
+          esac
+
+          ACTION="${{ github.event.inputs.action }}"
+          [ -z "$ACTION" ] && ACTION=sync
+
+          echo "branch_env=$BRANCH_ENV"   >> "$GITHUB_OUTPUT"
+          echo "vercel_target=$VERCEL_TARGET" >> "$GITHUB_OUTPUT"
+          echo "action=$ACTION"           >> "$GITHUB_OUTPUT"
+          echo "Env: $BRANCH_ENV → Vercel target: $VERCEL_TARGET | Action: $ACTION"
+
+      # ── Audit: list all vars currently set in Vercel ───────────────────────
+      - name: Audit Vercel env vars
+        if: steps.ctx.outputs.action == 'audit' || steps.ctx.outputs.action == 'sync'
+        env:
+          VERCEL_TOKEN:      ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID:     ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+        run: |
+          TARGET="${{ steps.ctx.outputs.vercel_target }}"
+          echo "=== Vercel env vars set for: $TARGET ==="
+          vercel env ls "$TARGET" --token="$VERCEL_TOKEN" 2>&1
+
+          echo ""
+          echo "=== Checking required variables ==="
+          # These are all the NEXT_PUBLIC_* vars Cairo needs at build time.
+          REQUIRED=(
+            NEXT_PUBLIC_BACKEND_URL
+            NEXT_PUBLIC_CHAIN_ID
+            NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID
+            NEXT_PUBLIC_OVERSEER_ADDRESS
+            NEXT_PUBLIC_EQUITY_VAULT_ADDRESS
+            NEXT_PUBLIC_MDT_ADDRESS
+            NEXT_PUBLIC_TRADE_EXECUTOR_ADDRESS
+            NEXT_PUBLIC_MARITIME_DEPOSIT_CONTRACT
+            NEXT_PUBLIC_MDT_TOKEN_CONTRACT
+            NEXT_PUBLIC_FIREBASE_API_KEY
+            NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN
+            NEXT_PUBLIC_FIREBASE_PROJECT_ID
+          )
+
+          # Get currently set vars from Vercel
+          vercel env ls "$TARGET" --token="$VERCEL_TOKEN" 2>/dev/null > /tmp/vercel_env_list.txt || true
+
+          MISSING=()
+          for VAR in "${REQUIRED[@]}"; do
+            if grep -q "$VAR" /tmp/vercel_env_list.txt 2>/dev/null; then
+              echo "  ✅ $VAR"
+            else
+              echo "  ❌ $VAR  ← MISSING"
+              MISSING+=("$VAR")
+            fi
+          done
+
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo ""
+            echo "::warning::${#MISSING[@]} required variable(s) missing from Vercel $TARGET: ${MISSING[*]}"
+            echo "Run this workflow with action=sync to add them, or set them manually:"
+            echo "  vercel env add NEXT_PUBLIC_BACKEND_URL $TARGET"
+          else
+            echo ""
+            echo "✅ All required variables are set in Vercel ($TARGET)"
+          fi
+
+      # ── Sync: add missing vars, update changed ones ────────────────────────
+      # Values come from GitHub Environment secrets/vars and are written
+      # into Vercel using `vercel env add` (piped via stdin — never echoed).
+      - name: Sync env vars → Vercel
+        if: steps.ctx.outputs.action == 'sync'
+        env:
+          VERCEL_TOKEN:      ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID:     ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+          TARGET:            ${{ steps.ctx.outputs.vercel_target }}
+
+          # ── Values to sync ─────────────────────────────────────────────────
+          # Non-secret: pulled from GitHub Environment variables
+          VAL_BACKEND_URL:                 ${{ vars.BACKEND_URL }}
+          VAL_CHAIN_ID:                    ${{ vars.CHAIN_ID }}
+          VAL_OVERSEER_ADDRESS:            ${{ vars.OVERSEER_ADDRESS }}
+          VAL_EQUITY_VAULT_ADDRESS:        ${{ vars.EQUITY_VAULT_ADDRESS }}
+          VAL_MDT_ADDRESS:                 ${{ vars.MDT_ADDRESS }}
+          VAL_TRADE_EXECUTOR_ADDRESS:      ${{ vars.TRADE_EXECUTOR_ADDRESS }}
+          VAL_MARITIME_DEPOSIT_CONTRACT:   ${{ vars.MARITIME_DEPOSIT_CONTRACT }}
+          VAL_FIREBASE_AUTH_DOMAIN:        ${{ vars.FIREBASE_AUTH_DOMAIN }}
+          VAL_FIREBASE_PROJECT_ID:         ${{ vars.FIREBASE_PROJECT_ID }}
+
+          # Secret: pulled from GitHub Environment secrets
+          VAL_WALLETCONNECT_PROJECT_ID:    ${{ secrets.WALLETCONNECT_PROJECT_ID }}
+          VAL_FIREBASE_API_KEY:            ${{ secrets.FIREBASE_API_KEY }}
+          VAL_PREVIEW_PASSWORD:            ${{ secrets.NEXT_PUBLIC_PREVIEW_PASSWORD }}
+
+        run: |
+          # upsert_vercel_env <KEY> <VALUE> <ENCRYPTED?>
+          # Uses `vercel env rm` + `vercel env add` for idempotent upsert.
+          # Value is passed via stdin — never appears in shell history or logs.
+          upsert() {
+            local KEY="$1" VALUE="$2" ENCRYPTED="${3:-false}"
+
+            if [ -z "$VALUE" ]; then
+              echo "  ⚠ Skipping $KEY (value not set in GitHub Environment)"
+              return
+            fi
+
+            # Remove existing value if present (vercel env add won't overwrite)
+            vercel env rm "$KEY" "$TARGET" --yes --token="$VERCEL_TOKEN" 2>/dev/null || true
+
+            # Add with value piped via stdin (never echoed to logs)
+            if [ "$ENCRYPTED" = "true" ]; then
+              printf '%s' "$VALUE" | vercel env add "$KEY" "$TARGET" --sensitive --token="$VERCEL_TOKEN" --stdin 2>&1
+            else
+              printf '%s' "$VALUE" | vercel env add "$KEY" "$TARGET" --token="$VERCEL_TOKEN" --stdin 2>&1
+            fi
+            echo "  ✓ $KEY → Vercel ($TARGET)"
+          }
+
+          echo "Syncing env vars → Vercel ($TARGET)…"
+
+          # ── Public vars (plain) ───────────────────────────────────────────
+          upsert "NEXT_PUBLIC_BACKEND_URL"               "$VAL_BACKEND_URL"
+          upsert "NEXT_PUBLIC_CHAIN_ID"                  "$VAL_CHAIN_ID"
+          upsert "NEXT_PUBLIC_OVERSEER_ADDRESS"          "$VAL_OVERSEER_ADDRESS"
+          upsert "NEXT_PUBLIC_EQUITY_VAULT_ADDRESS"      "$VAL_EQUITY_VAULT_ADDRESS"
+          upsert "NEXT_PUBLIC_MDT_ADDRESS"               "$VAL_MDT_ADDRESS"
+          upsert "NEXT_PUBLIC_MDT_TOKEN_CONTRACT"        "$VAL_MDT_ADDRESS"
+          upsert "NEXT_PUBLIC_TRADE_EXECUTOR_ADDRESS"    "$VAL_TRADE_EXECUTOR_ADDRESS"
+          upsert "NEXT_PUBLIC_MARITIME_DEPOSIT_CONTRACT" "$VAL_MARITIME_DEPOSIT_CONTRACT"
+          upsert "NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN"      "$VAL_FIREBASE_AUTH_DOMAIN"
+          upsert "NEXT_PUBLIC_FIREBASE_PROJECT_ID"       "$VAL_FIREBASE_PROJECT_ID"
+
+          # ── Sensitive vars (encrypted in Vercel) ──────────────────────────
+          upsert "NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID"  "$VAL_WALLETCONNECT_PROJECT_ID"  true
+          upsert "NEXT_PUBLIC_FIREBASE_API_KEY"          "$VAL_FIREBASE_API_KEY"          true
+          upsert "NEXT_PUBLIC_PREVIEW_PASSWORD"          "$VAL_PREVIEW_PASSWORD"          true
+
+          echo ""
+          echo "=== Final state in Vercel ($TARGET) ==="
+          vercel env ls "$TARGET" --token="$VERCEL_TOKEN" 2>&1
+          echo "✅ Sync complete"
+
+      # ── Remove: delete a single variable ──────────────────────────────────
+      - name: Remove env var from Vercel
+        if: steps.ctx.outputs.action == 'remove'
+        env:
+          VERCEL_TOKEN:      ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID:     ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+          TARGET:            ${{ steps.ctx.outputs.vercel_target }}
+          VAR_NAME:          ${{ github.event.inputs.var_name }}
+        run: |
+          if [ -z "$VAR_NAME" ]; then
+            echo "❌ var_name input is required for the remove action"
+            exit 1
+          fi
+          echo "Removing $VAR_NAME from Vercel ($TARGET)…"
+          vercel env rm "$VAR_NAME" "$TARGET" --yes --token="$VERCEL_TOKEN"
+          echo "✅ Removed $VAR_NAME"
+          echo "=== Remaining vars ==="
+          vercel env ls "$TARGET" --token="$VERCEL_TOKEN" 2>&1
