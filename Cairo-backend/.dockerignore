@@ -1,0 +1,35 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Cairo-backend — .dockerignore
+# ─────────────────────────────────────────────────────────────────────────────
+
+node_modules/
+dist/
+.npm/
+
+# Environment files — NEVER in the image
+.env
+.env.*
+!.env.example
+
+.git/
+.gitignore
+.github/
+.gitea/
+
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+*.log
+npm-debug.log*
+
+coverage/
+.nyc_output/
+
+Dockerfile*
+docker-compose*
+.dockerignore
+
+*.md
+docs/

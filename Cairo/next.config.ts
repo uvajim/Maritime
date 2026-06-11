@@ -9,6 +9,9 @@ const nextConfig: NextConfig = {
   typescript: {
     ignoreBuildErrors: true,
   },
+  // Produces a self-contained output in .next/standalone, used by the Dockerfile.
+  // This copies only the required node_modules subset and a minimal server.js.
+  output: "standalone",
   images: {
     remotePatterns: [
       { protocol: "https", hostname: "assets.parqet.com" },
