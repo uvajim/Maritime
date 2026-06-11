@@ -1,0 +1,239 @@
+name: CI
+
+# GitHub Actions / Gitea Actions compatible CI for the Maritime monorepo.
+#
+# Packages:
+#   - Cairo          (Next.js frontend)
+#   - Cairo-backend  (Express/TS API)
+#   - cairo-erc20    (Hardhat/Solidity contracts)
+#
+# Jobs:
+#   - git-hygiene     : blocks committed secrets/keys, conflict markers, oversized files
+#   - detect-changes  : figures out which package(s) changed
+#   - build-test-*    : per-package lint + build + (configurable) test
+#   - security        : secret scan, dependency/CVE scan, SAST, Dockerfile lint
+#
+# "Configurable tests": run via `workflow_dispatch` with `run_tests: false` to
+# skip the test step (lint/build still run), or `audit_level` to tune the
+# `npm audit` severity threshold used by the security job.
+
+on:
+  push:
+    branches: [dev, beta, main]
+  pull_request:
+    branches: [dev, beta, main]
+  workflow_dispatch:
+    inputs:
+      run_tests:
+        description: "Run package test suites (lint/build always run)"
+        type: boolean
+        default: true
+      audit_level:
+        description: "npm audit severity threshold"
+        type: choice
+        options:
+          - low
+          - moderate
+          - high
+          - critical
+        default: high
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+
+jobs:
+  # ── Git hygiene ──────────────────────────────────────────────────────────────
+  git-hygiene:
+    name: Git hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Block committed secrets, keys, conflict markers, oversized files
+        run: bash scripts/ci/check-git-hygiene.sh
+
+  # ── Change detection ─────────────────────────────────────────────────────────
+  detect-changes:
+    name: Detect changed packages
+    runs-on: ubuntu-latest
+    outputs:
+      frontend: ${{ steps.detect.outputs.frontend }}
+      backend: ${{ steps.detect.outputs.backend }}
+      contracts: ${{ steps.detect.outputs.contracts }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: detect
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_REF="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE_REF="${{ github.event.before }}"
+          fi
+          bash scripts/ci/detect-changes.sh "$BASE_REF" "${{ github.sha }}"
+        env:
+          FORCE_ALL: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
+
+  # ── Build / lint / test ──────────────────────────────────────────────────────
+  # One job per package (not a matrix): job-level `if:` cannot reference the
+  # `matrix` context on GitHub Actions, so the per-package "did this change?"
+  # gate is expressed as three near-identical jobs instead.
+  build-test-frontend:
+    name: build-test (frontend)
+    needs: [detect-changes]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.frontend == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: Cairo/package-lock.json
+
+      - name: Install dependencies
+        working-directory: Cairo
+        run: npm ci
+
+      - name: Lint
+        working-directory: Cairo
+        run: npm run lint
+
+      - name: Build
+        working-directory: Cairo
+        run: npm run build
+
+      - name: Test
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.run_tests != 'false'
+        working-directory: Cairo
+        run: npm test
+
+  build-test-backend:
+    name: build-test (backend)
+    needs: [detect-changes]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.backend == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: Cairo-backend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: Cairo-backend
+        run: npm ci
+
+      - name: Lint
+        working-directory: Cairo-backend
+        run: npm run lint
+
+      - name: Build
+        working-directory: Cairo-backend
+        run: npm run build
+
+      - name: Test
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.run_tests != 'false'
+        working-directory: Cairo-backend
+        run: npm test
+
+  build-test-contracts:
+    name: build-test (contracts)
+    needs: [detect-changes]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.contracts == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: cairo-erc20/package-lock.json
+
+      - name: Install dependencies
+        working-directory: cairo-erc20
+        run: npm ci
+
+      - name: Lint
+        working-directory: cairo-erc20
+        run: npm run lint
+
+      - name: Build
+        working-directory: cairo-erc20
+        run: npm run build
+
+      - name: Test
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.run_tests != 'false'
+        working-directory: cairo-erc20
+        run: npm test
+
+  # ── Security checks ──────────────────────────────────────────────────────────
+  security:
+    name: Security checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 1. Secret scanning — fails if any API keys/tokens/private keys are
+      #    committed (allowlist for *.env.example etc. lives in .gitleaks.toml).
+      - name: Gitleaks (secret scan)
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest \
+            detect --source=/repo --config=/repo/.gitleaks.toml \
+            --no-git -v --redact --exit-code 1
+
+      # 2. Dependency / known-CVE scan across all three package ecosystems.
+      - name: Trivy filesystem scan (dependency CVEs)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      # 3. npm audit per package (configurable severity threshold).
+      - name: npm audit — frontend (Cairo)
+        working-directory: Cairo
+        run: npm audit --audit-level=${{ github.event.inputs.audit_level || 'high' }}
+
+      - name: npm audit — backend (Cairo-backend)
+        working-directory: Cairo-backend
+        run: npm audit --audit-level=${{ github.event.inputs.audit_level || 'high' }}
+
+      - name: npm audit — contracts (cairo-erc20)
+        working-directory: cairo-erc20
+        run: npm audit --audit-level=${{ github.event.inputs.audit_level || 'high' }}
+
+      # 4. SAST — common injection / hardcoded-secret / unsafe-eval patterns
+      #    across JS/TS and Solidity. `p/ci` is Semgrep's free default ruleset
+      #    and requires no API token/login.
+      - name: Semgrep SAST
+        run: |
+          docker run --rm -v "$PWD:/src" semgrep/semgrep \
+            semgrep scan --config=p/ci --error --metrics=off /src
+
+      # 5. Dockerfile lint.
+      - name: Hadolint — Cairo/Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Cairo/Dockerfile
+
+      - name: Hadolint — Cairo-backend/Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Cairo-backend/Dockerfile

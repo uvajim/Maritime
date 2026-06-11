@@ -1,0 +1,12 @@
+{
+  "$comment": "Variable NAMES synced to Vercel for the Cairo frontend. env-sync.yml resolves each NAME to a `<NAME>__<DEV|BETA|MAIN>` secret/var and pushes it to the matching Vercel project. No values live here.",
+  "vars": [
+    "NEXT_PUBLIC_CHAIN_ID",
+    "BACKEND_URL",
+    "NEXT_PUBLIC_DHOW_DEPOSIT_CONTRACT",
+    "NEXT_PUBLIC_EQUITY_VAULT_ADDRESS",
+    "NEXT_PUBLIC_TRADE_EXECUTOR_ADDRESS",
+    "NEXT_PUBLIC_dUSD_TOKEN_CONTRACT",
+    "NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID"
+  ]
+}

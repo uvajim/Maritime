@@ -1,0 +1,82 @@
+name: Env Sync
+
+# Programmatically pushes environment variables/secrets into Vercel and/or
+# Railway for a given environment, driven by deploy/env-manifests/*.json
+# (which list variable NAMES only — actual values come from this repo's
+# CI secrets/vars, never from files committed to source control).
+#
+# For each manifest entry "FOO", the workflow looks for a secret or var
+# named "FOO__<DEV|BETA|MAIN>" (see docs/SECRETS.md) and, if present, syncs
+# it to the chosen provider for the chosen environment.
+#
+# Manual-only: run via "Run workflow" (workflow_dispatch). Never triggered by
+# push/PR, since it mutates external provider state.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        type: choice
+        options: [dev, beta, main]
+        required: true
+      target:
+        description: "Which provider(s) to sync"
+        type: choice
+        options: [vercel, railway, both]
+        default: both
+
+jobs:
+  sync:
+    name: Sync env vars (${{ github.event.inputs.environment }} / ${{ github.event.inputs.target }})
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      ENV_UPPER: ${{ github.event.inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Normalize environment name to uppercase
+        run: echo "ENV_UPPER=$(echo '${{ github.event.inputs.environment }}' | tr '[:lower:]' '[:upper:]')" >> "$GITHUB_ENV"
+
+      - name: Install jq
+        run: sudo apt-get update -y && sudo apt-get install -y jq
+
+      - name: Dump secrets/vars to disk (masked)
+        run: |
+          umask 077
+          cat <<'EOF' > secrets.json
+          ${{ toJSON(secrets) }}
+          EOF
+          cat <<'EOF' > vars.json
+          ${{ toJSON(vars) }}
+          EOF
+
+      - name: Install Vercel CLI
+        if: github.event.inputs.target == 'vercel' || github.event.inputs.target == 'both'
+        run: npm install --global vercel@latest
+
+      - name: Sync frontend vars to Vercel
+        if: github.event.inputs.target == 'vercel' || github.event.inputs.target == 'both'
+        run: bash scripts/ci/sync-env-vars.sh vercel "${{ github.event.inputs.environment }}" deploy/env-manifests/frontend.json secrets.json vars.json
+        env:
+          VERCEL_TOKEN: ${{ secrets[format('VERCEL_TOKEN__{0}', env.ENV_UPPER)] }}
+          VERCEL_ORG_ID: ${{ secrets[format('VERCEL_ORG_ID__{0}', env.ENV_UPPER)] }}
+          VERCEL_PROJECT_ID: ${{ secrets[format('VERCEL_PROJECT_ID__{0}', env.ENV_UPPER)] }}
+
+      - name: Install Railway CLI
+        if: github.event.inputs.target == 'railway' || github.event.inputs.target == 'both'
+        run: npm install --global @railway/cli
+
+      - name: Sync backend vars to Railway
+        if: github.event.inputs.target == 'railway' || github.event.inputs.target == 'both'
+        # RAILWAY_TOKEN is a project token, pre-scoped to one project+environment
+        # (created in Railway: Project -> Settings -> Tokens), so no `railway
+        # link` step is needed — `railway variables` operates on that scope directly.
+        run: bash scripts/ci/sync-env-vars.sh railway "${{ github.event.inputs.environment }}" deploy/env-manifests/backend.json secrets.json vars.json
+        env:
+          RAILWAY_TOKEN: ${{ secrets[format('RAILWAY_TOKEN__{0}', env.ENV_UPPER)] }}
+
+      - name: Clean up dumped secrets
+        if: always()
+        run: rm -f secrets.json vars.json

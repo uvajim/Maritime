@@ -4,7 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "hardhat compile",
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "test": "hardhat test"
   },
   "overrides": {
     "lodash": "4.18.1",
