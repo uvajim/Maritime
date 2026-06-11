@@ -132,13 +132,17 @@ jobs:
           VAL_PREVIEW_PASSWORD:          ${{ secrets.NEXT_PUBLIC_PREVIEW_PASSWORD }}
         run: |
           upsert() {
-            local KEY="$1" VALUE="$2" ENCRYPTED="${3:-false}"
+            local KEY="$1" VALUE="$2" SENSITIVE="${3:-false}"
             if [ -z "$VALUE" ]; then echo "  ⚠ Skipping $KEY (empty)"; return; fi
             vercel env rm "$KEY" "$TARGET" --yes --token="$VERCEL_TOKEN" 2>/dev/null || true
-            if [ "$ENCRYPTED" = "true" ]; then
-              printf '%s' "$VALUE" | vercel env add "$KEY" "$TARGET" --sensitive --token="$VERCEL_TOKEN" --stdin 2>&1
+            if [ "$SENSITIVE" = "true" ]; then
+              vercel env add "$KEY" "$TARGET" \
+                --value="$VALUE" --sensitive --yes \
+                --token="$VERCEL_TOKEN" 2>&1
             else
-              printf '%s' "$VALUE" | vercel env add "$KEY" "$TARGET" --token="$VERCEL_TOKEN" --stdin 2>&1
+              vercel env add "$KEY" "$TARGET" \
+                --value="$VALUE" --no-sensitive --yes \
+                --token="$VERCEL_TOKEN" 2>&1
             fi
             echo "  ✓ $KEY"
           }

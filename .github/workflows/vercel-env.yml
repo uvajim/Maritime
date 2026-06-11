@@ -180,27 +180,35 @@ jobs:
           VAL_PREVIEW_PASSWORD:            ${{ secrets.NEXT_PUBLIC_PREVIEW_PASSWORD }}
 
         run: |
-          # upsert_vercel_env <KEY> <VALUE> <ENCRYPTED?>
-          # Uses `vercel env rm` + `vercel env add` for idempotent upsert.
-          # Value is passed via stdin — never appears in shell history or logs.
+          # upsert <KEY> <VALUE> <SENSITIVE?>
+          # Idempotent: rm existing then add fresh.
+          # Value is passed via --value flag so it never touches shell history.
+          # --yes skips the interactive confirmation prompt (added in CLI v37+).
+          # --sensitive / --no-sensitive controls Vercel encryption tier.
           upsert() {
-            local KEY="$1" VALUE="$2" ENCRYPTED="${3:-false}"
+            local KEY="$1" VALUE="$2" SENSITIVE="${3:-false}"
 
             if [ -z "$VALUE" ]; then
               echo "  ⚠ Skipping $KEY (value not set in GitHub Environment)"
               return
             fi
 
-            # Remove existing value if present (vercel env add won't overwrite)
+            # Remove any existing value first (env add --force also works but
+            # rm+add gives a clean audit trail in the Vercel dashboard log).
             vercel env rm "$KEY" "$TARGET" --yes --token="$VERCEL_TOKEN" 2>/dev/null || true
 
-            # Add with value piped via stdin (never echoed to logs)
-            if [ "$ENCRYPTED" = "true" ]; then
-              printf '%s' "$VALUE" | vercel env add "$KEY" "$TARGET" --sensitive --token="$VERCEL_TOKEN" --stdin 2>&1
+            # Add the variable. Value is passed via --value so it is never
+            # echoed to the shell or visible in ps output.
+            if [ "$SENSITIVE" = "true" ]; then
+              vercel env add "$KEY" "$TARGET" \
+                --value="$VALUE" --sensitive --yes \
+                --token="$VERCEL_TOKEN" 2>&1
             else
-              printf '%s' "$VALUE" | vercel env add "$KEY" "$TARGET" --token="$VERCEL_TOKEN" --stdin 2>&1
+              vercel env add "$KEY" "$TARGET" \
+                --value="$VALUE" --no-sensitive --yes \
+                --token="$VERCEL_TOKEN" 2>&1
             fi
-            echo "  ✓ $KEY → Vercel ($TARGET)"
+            echo "  ✓ $KEY"
           }
 
           echo "Syncing env vars → Vercel ($TARGET)…"
