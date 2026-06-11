@@ -1,0 +1,181 @@
+name: Deploy
+
+# Deploys Cairo (frontend -> Vercel) and Cairo-backend (backend -> Railway)
+# to one of three fully-isolated environments: dev, beta, main.
+#
+# Guardrails (do not deploy arbitrary branches):
+#   - `push` triggers only fire for dev/beta/main, and the branch IS the
+#     environment (dev->dev, beta->beta, main->main).
+#   - `workflow_dispatch` requires choosing `environment` explicitly, AND the
+#     workflow must be run FROM one of the dev/beta/main branches
+#     (`github.ref_name`). Dispatching this workflow from a feature branch
+#     hard-fails in `resolve-environment` before any deploy step runs.
+#
+# Secrets/vars are namespaced per environment as `<NAME>__<DEV|BETA|MAIN>`
+# (see docs/SECRETS.md). GitHub's native `environment:` is also set on each
+# deploy job so GitHub-side required reviewers / wait timers can be layered
+# on top if desired; Gitea ignores the field harmlessly.
+#
+# Provider notes:
+#   - Vercel: 3 separate Vercel projects (one per environment) — see
+#     docs/DEPLOYMENT.md for setup and the migration path to other hosts.
+#   - Railway: 3 separate Railway environments/project tokens.
+
+on:
+  push:
+    branches: [dev, beta, main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        type: choice
+        options: [dev, beta, main]
+        required: true
+      deploy_frontend:
+        description: "Deploy frontend (Vercel)"
+        type: boolean
+        default: true
+      deploy_backend:
+        description: "Deploy backend (Railway)"
+        type: boolean
+        default: true
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve-environment:
+    name: Resolve & validate target environment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.resolve.outputs.environment }}
+      env_upper: ${{ steps.resolve.outputs.env_upper }}
+      deploy_frontend: ${{ steps.resolve.outputs.deploy_frontend }}
+      deploy_backend: ${{ steps.resolve.outputs.deploy_backend }}
+    steps:
+      - id: resolve
+        run: |
+          set -euo pipefail
+          REF_NAME="${{ github.ref_name }}"
+          APPROVED="dev beta main"
+
+          is_approved() {
+            for b in $APPROVED; do
+              [ "$1" = "$b" ] && return 0
+            done
+            return 1
+          }
+
+          if ! is_approved "$REF_NAME"; then
+            echo "::error::Refusing to deploy: '$REF_NAME' is not an approved deployment branch (dev, beta, main)."
+            exit 1
+          fi
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ENVIRONMENT="${{ github.event.inputs.environment }}"
+            DEPLOY_FRONTEND="${{ github.event.inputs.deploy_frontend }}"
+            DEPLOY_BACKEND="${{ github.event.inputs.deploy_backend }}"
+          else
+            # push event: branch name IS the environment
+            ENVIRONMENT="$REF_NAME"
+            DEPLOY_FRONTEND="true"
+            DEPLOY_BACKEND="true"
+          fi
+
+          if ! is_approved "$ENVIRONMENT"; then
+            echo "::error::Invalid environment input '$ENVIRONMENT' (expected dev, beta, or main)."
+            exit 1
+          fi
+
+          ENV_UPPER="$(echo "$ENVIRONMENT" | tr '[:lower:]' '[:upper:]')"
+
+          {
+            echo "environment=$ENVIRONMENT"
+            echo "env_upper=$ENV_UPPER"
+            echo "deploy_frontend=$DEPLOY_FRONTEND"
+            echo "deploy_backend=$DEPLOY_BACKEND"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Deploying ref '$REF_NAME' -> environment '$ENVIRONMENT' (frontend=$DEPLOY_FRONTEND backend=$DEPLOY_BACKEND)"
+
+  deploy-frontend:
+    name: Deploy frontend (Vercel / ${{ needs.resolve-environment.outputs.environment }})
+    needs: [resolve-environment]
+    if: needs.resolve-environment.outputs.deploy_frontend == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve-environment.outputs.environment }}
+    env:
+      ENV_UPPER: ${{ needs.resolve-environment.outputs.env_upper }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: Cairo/package-lock.json
+
+      - name: Resolve Vercel credentials for this environment
+        id: creds
+        run: |
+          echo "::add-mask::${{ secrets[format('VERCEL_TOKEN__{0}', env.ENV_UPPER)] }}"
+          if [ -z "${{ secrets[format('VERCEL_TOKEN__{0}', env.ENV_UPPER)] }}" ]; then
+            echo "::error::Missing secret VERCEL_TOKEN__${ENV_UPPER}. See docs/SECRETS.md."
+            exit 1
+          fi
+
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      - name: Pull Vercel project settings
+        working-directory: Cairo
+        run: vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
+        env:
+          VERCEL_TOKEN: ${{ secrets[format('VERCEL_TOKEN__{0}', env.ENV_UPPER)] }}
+          VERCEL_ORG_ID: ${{ secrets[format('VERCEL_ORG_ID__{0}', env.ENV_UPPER)] }}
+          VERCEL_PROJECT_ID: ${{ secrets[format('VERCEL_PROJECT_ID__{0}', env.ENV_UPPER)] }}
+
+      - name: Build (Vercel)
+        working-directory: Cairo
+        run: vercel build --prod --token="$VERCEL_TOKEN"
+        env:
+          VERCEL_TOKEN: ${{ secrets[format('VERCEL_TOKEN__{0}', env.ENV_UPPER)] }}
+          VERCEL_ORG_ID: ${{ secrets[format('VERCEL_ORG_ID__{0}', env.ENV_UPPER)] }}
+          VERCEL_PROJECT_ID: ${{ secrets[format('VERCEL_PROJECT_ID__{0}', env.ENV_UPPER)] }}
+
+      - name: Deploy (Vercel, prebuilt)
+        working-directory: Cairo
+        run: vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN"
+        env:
+          VERCEL_TOKEN: ${{ secrets[format('VERCEL_TOKEN__{0}', env.ENV_UPPER)] }}
+          VERCEL_ORG_ID: ${{ secrets[format('VERCEL_ORG_ID__{0}', env.ENV_UPPER)] }}
+          VERCEL_PROJECT_ID: ${{ secrets[format('VERCEL_PROJECT_ID__{0}', env.ENV_UPPER)] }}
+
+  deploy-backend:
+    name: Deploy backend (Railway / ${{ needs.resolve-environment.outputs.environment }})
+    needs: [resolve-environment]
+    if: needs.resolve-environment.outputs.deploy_backend == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve-environment.outputs.environment }}
+    env:
+      ENV_UPPER: ${{ needs.resolve-environment.outputs.env_upper }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve Railway credentials for this environment
+        run: |
+          if [ -z "${{ secrets[format('RAILWAY_TOKEN__{0}', env.ENV_UPPER)] }}" ]; then
+            echo "::error::Missing secret RAILWAY_TOKEN__${ENV_UPPER}. See docs/SECRETS.md."
+            exit 1
+          fi
+
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Deploy to Railway
+        working-directory: Cairo-backend
+        run: railway up --service="${RAILWAY_SERVICE}" --ci
+        env:
+          RAILWAY_TOKEN: ${{ secrets[format('RAILWAY_TOKEN__{0}', env.ENV_UPPER)] }}
+          RAILWAY_SERVICE: ${{ vars[format('RAILWAY_SERVICE__{0}', env.ENV_UPPER)] || 'cairo-backend' }}

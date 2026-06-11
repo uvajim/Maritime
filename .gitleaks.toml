@@ -1,0 +1,31 @@
+# Gitleaks configuration — secret scanning for the Maritime monorepo.
+#
+# Extends the default gitleaks ruleset and adds an allowlist for files that
+# intentionally contain placeholder/example values (not real secrets).
+#
+# Run locally:
+#   docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest \
+#     detect --source=/repo --config=/repo/.gitleaks.toml --no-git -v
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Allow committed example/template env files and known test fixtures"
+
+paths = [
+  '''.*\.env\.example$''',
+  '''Cairo/\.env\.development$''',
+  '''Cairo/\.env\.production$''',
+  '''.*/test/.*''',
+  '''.*\.lock$''',
+  '''package-lock\.json$''',
+]
+
+# Placeholder values used throughout the *.env.example files. These match
+# obvious "fill me in" / known sample values, never real credentials.
+regexes = [
+  '''your_[a-z0-9_]+_here''',
+  '''word1 word2 word3 \.\.\. word12''',
+  '''0x0{40}''',
+]
