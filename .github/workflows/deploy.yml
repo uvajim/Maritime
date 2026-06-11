@@ -324,6 +324,9 @@ jobs:
     environment: ${{ needs.guard.outputs.environment }}
     steps:
       - name: Health-check backend
+        # Only check the backend if it was actually deployed in this run.
+        # Skips gracefully when only the frontend was deployed (no Railway token yet, etc.)
+        if: needs.deploy-backend.result == 'success'
         run: |
           BACKEND_URL="${{ vars.BACKEND_URL }}"
           if [ -z "$BACKEND_URL" ]; then
